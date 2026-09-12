@@ -1,0 +1,10 @@
+name: ionos-dnssec
+description: Create, update and delete DNSSEC DS records for IONOS DNS zones
+category: network-system
+owner: "@balakar94"
+status: incubating
+compat: all
+impact: read-only
+last_verified: 2026-09-12
+version: 1.0.0
+license: Apache-2.0
