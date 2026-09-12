@@ -1,0 +1,182 @@
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+
+jobs:
+  markdownlint:
+    name: "Docs: markdownlint"
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/setup-node@v7.0.0
+        with:
+          node-version: "20.18.0"
+      - run: npm install --no-save markdownlint-cli@0.41.0
+      - run: npx markdownlint-cli "**/*.md" --config .markdownlint.json
+
+  shellcheck:
+    name: "Shell: shellcheck"
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends shellcheck
+      - run: git ls-files '*.sh' | xargs -r shellcheck -S warning
+
+  shfmt:
+    name: "Shell: shfmt"
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - name: Install shfmt (pinned + checksum-verified)
+        run: |
+          curl -fsSL -o shfmt https://github.com/mvdan/sh/releases/download/v3.11.0/shfmt_v3.11.0_linux_amd64
+          echo "1904ec6bac715c1d05cd7f6612eec8f67a625c3749cb327e5bfb4127d09035ff  shfmt" | sha256sum -c -
+          chmod +x shfmt
+      - run: ./shfmt -d -i 2 -ci -sr scripts templates tools
+
+  validate:
+    name: "Repo: structure and metadata"
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - run: bash scripts/list-tools.sh --check
+      - name: TOOLS.md is up to date
+        run: |
+          bash scripts/list-tools.sh
+          git diff --ignore-cr-at-eol --exit-code -- TOOLS.md \
+            || { echo "TOOLS.md is stale: run scripts/list-tools.sh"; exit 1; }
+
+  python:
+    name: "Python: syntax"
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/setup-python@v7.0.0
+        with:
+          python-version: "3.11"
+      - run: git ls-files '*.py' | xargs -r -n1 python3 -m py_compile
+
+  ruby:
+    name: "Ruby: syntax"
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - run: git ls-files '*.rb' | xargs -r -n1 ruby -c
+
+  powershell:
+    name: "PowerShell: syntax"
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - run: |
+          git ls-files -z '*.ps1' | while IFS= read -r -d '' f; do
+            echo "checking $f"
+            FILE="$f" pwsh -NoProfile -NonInteractive -Command '$errs=$null; [void][System.Management.Automation.PSParser]::Tokenize((Get-Content -LiteralPath $env:FILE -Raw), [ref]$errs); if ($errs.Count -gt 0) { $errs | ForEach-Object { Write-Error $_.Message }; exit 1 }'
+          done
+
+  secrets:
+    name: "Security: secret scan"
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          fetch-depth: 0
+      - uses: gitleaks/gitleaks-action@v3.0.0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  smoke-linux:
+    name: "Smoke: Linux"
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - name: per-language smoke tests + examples (bash/py/rb)
+        run: |
+          shopt -s nullglob
+          dirs=(tools/*/)
+          if [ ${#dirs[@]} -eq 0 ]; then
+            echo "no tools found (OK with 0 tools)"
+            exit 0
+          fi
+          fail=0
+          for d in "${dirs[@]}"; do
+            slug="$(basename "$d")"
+            case "$slug" in _archived|archived) continue;; esac
+            entry=""
+            for m in sh py ps1 rb; do
+              if [ -f "$d/main.$m" ]; then entry="$m"; break; fi
+            done
+            case "$entry" in
+              sh) runner="bash"; tests="$d/tests/test_basic.sh"; example="$d/examples/basic.sh" ;;
+              py) runner="python3"; tests="$d/tests/test_basic.py"; example="$d/examples/basic.py" ;;
+              rb) runner="ruby"; tests="$d/tests/test_basic.rb"; example="$d/examples/basic.rb" ;;
+              ps1) echo "== $slug: PowerShell tool, covered on windows-latest"; continue ;;
+              *) echo "missing entrypoint: $slug"; fail=1; continue ;;
+            esac
+            echo "== $tests"
+            "$runner" "$tests" || fail=1
+            if [ -f "$example" ]; then
+              echo "== $example"
+              "$runner" "$example" || fail=1
+            fi
+          done
+          exit "$fail"
+
+  smoke-windows:
+    name: "Smoke: Windows"
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - name: metadata check (PowerShell twin)
+        shell: pwsh
+        run: pwsh scripts/list-tools.ps1 --check
+      - name: TOOLS.md is up to date (PowerShell twin)
+        shell: pwsh
+        run: |
+          pwsh scripts/list-tools.ps1
+          git diff --ignore-cr-at-eol --exit-code -- TOOLS.md
+          if ($LASTEXITCODE -ne 0) { Write-Error 'TOOLS.md is stale: run scripts/list-tools.ps1'; exit 1 }
+      - name: per-language smoke tests + examples (ps1/py/rb)
+        shell: pwsh
+        run: |
+          $fail = 0
+          $dirs = Get-ChildItem -Directory -LiteralPath tools -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -ne '_archived' -and $_.Name -ne 'archived' }
+          if (-not $dirs) { Write-Host 'no tools found (OK with 0 tools)'; exit 0 }
+          foreach ($d in $dirs) {
+            $runner = $null; $ext = $null
+            if (Test-Path -LiteralPath (Join-Path $d.FullName 'main.ps1')) { $runner = 'pwsh'; $ext = 'ps1' }
+            elseif (Test-Path -LiteralPath (Join-Path $d.FullName 'main.py')) { $runner = 'python'; $ext = 'py' }
+            elseif (Test-Path -LiteralPath (Join-Path $d.FullName 'main.rb')) { $runner = 'ruby'; $ext = 'rb' }
+            else {
+              if (Test-Path -LiteralPath (Join-Path $d.FullName 'main.sh')) {
+                Write-Host "== $($d.Name): bash tool, covered on ubuntu-24.04"
+              } else {
+                Write-Error "missing entrypoint: $($d.Name)"; $fail = 1
+              }
+              continue
+            }
+            $tests = Join-Path $d.FullName "tests/test_basic.$ext"
+            $example = Join-Path $d.FullName "examples/basic.$ext"
+            Write-Host "== $tests"
+            if ($runner -eq 'pwsh') { & pwsh -NoProfile -NonInteractive -File $tests }
+            else { & $runner $tests }
+            if ($LASTEXITCODE -ne 0) { $fail = 1 }
+            if (Test-Path -LiteralPath $example) {
+              Write-Host "== $example"
+              if ($runner -eq 'pwsh') { & pwsh -NoProfile -NonInteractive -File $example }
+              else { & $runner $example }
+              if ($LASTEXITCODE -ne 0) { $fail = 1 }
+            }
+          }
+          if ($fail -ne 0) { exit 1 } else { exit 0 }

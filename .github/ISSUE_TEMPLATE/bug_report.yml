@@ -1,0 +1,27 @@
+name: Bug report
+description: Report a broken tool
+title: "[bug] <tool>: "
+labels: ["bug"]
+body:
+  - type: input
+    id: tool
+    attributes:
+      label: Tool
+      placeholder: tools/my-tool
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Repro (commands + output)
+      placeholder: |
+        # the tool's native test, e.g.
+        bash tools/my-tool/tests/test_basic.sh
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected vs actual
+    validations:
+      required: true

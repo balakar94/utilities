@@ -1,0 +1,24 @@
+name: Proposal / Feature
+description: Propose a new tool or improvement
+title: "[proposal] <kebab-name>: "
+labels: ["proposal"]
+body:
+  - type: input
+    id: name
+    attributes:
+      label: kebab-case name
+      placeholder: rename-photos
+    validations:
+      required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem → user → frequency (max 40 words)
+    validations:
+      required: true
+  - type: textarea
+    id: scope
+    attributes:
+      label: Use for / Not for
+    validations:
+      required: true

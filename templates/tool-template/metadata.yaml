@@ -1,0 +1,10 @@
+name: __TOOL_NAME__
+description: What it does in max 12 words
+category: automation
+owner: "@user"
+status: incubating
+compat: all
+impact: read-only
+last_verified: YYYY-MM-DD
+version: 0.1.0
+license: Apache-2.0
