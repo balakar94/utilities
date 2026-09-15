@@ -43,7 +43,7 @@ def require_apply(args, cmd):
     try:
         euid = os.geteuid()
     except AttributeError:
-        euid = 0
+        euid = 1000
     if euid != 0 and not getattr(args, "sudo", False):
         emit(note(t("err_need_root").format(cmd=cmd), "err", args, indent=1), stream="err")
         raise SystemExit(1)

@@ -509,7 +509,7 @@ def _print_menu_screen(args, flash=None):
 
     # Status Section
     st_title = "ESTADO DEL SERVIDOR" if lang == "es" else ("SERVERSTATUS" if lang == "de" else "SERVER STATUS")
-    lines.append(box_line("  " + paint("● " + st_title, "section", args)))
+    lines.append(box_line("  " + paint(chars["bullet"] + " " + st_title, "section", args)))
 
     status_dict = {str(item[0]): item for item in _menu_status_lines(args)}
     lbl_srv = t("menu_box_server")
@@ -564,14 +564,14 @@ def _print_menu_screen(args, flash=None):
     t_server = t("menu_group_server")
     t_safety = t("menu_group_safety")
 
-    h1_text = "── " + t_peers + " "
-    h1 = paint(h1_text, "section", args) + paint("─" * max(0, col1_w - len(h1_text)), "rule", args)
+    h1_text = (h * 2) + " " + t_peers + " "
+    h1 = paint(h1_text, "section", args) + paint(h * max(0, col1_w - len(h1_text)), "rule", args)
 
-    h2_srv_text = "── " + t_server + " "
-    h2_srv = paint(h2_srv_text, "section", args) + paint("─" * max(0, col2_w - len(h2_srv_text)), "rule", args)
+    h2_srv_text = (h * 2) + " " + t_server + " "
+    h2_srv = paint(h2_srv_text, "section", args) + paint(h * max(0, col2_w - len(h2_srv_text)), "rule", args)
 
-    h2_saf_text = "── " + t_safety + " "
-    h2_saf = paint(h2_saf_text, "section", args) + paint("─" * max(0, col2_w - len(h2_saf_text)), "rule", args)
+    h2_saf_text = (h * 2) + " " + t_safety + " "
+    h2_saf = paint(h2_saf_text, "section", args) + paint(h * max(0, col2_w - len(h2_saf_text)), "rule", args)
 
     col1 = [
         h1,

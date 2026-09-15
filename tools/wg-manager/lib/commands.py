@@ -1920,7 +1920,7 @@ def cmd_uninstall(args):
         try:
             euid = os.geteuid()
         except AttributeError:
-            euid = 0
+            euid = 1000
         if euid == 0 or getattr(args, "sudo", False):
             args.apply = True
             args.yes = True

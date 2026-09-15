@@ -374,10 +374,16 @@ def main():
                 "WG_MANAGER_STATE": str(test_state),
             }
             clean_cmd = subprocess.run(
-                [sys.executable, "-c",
-                 "import sys; from pathlib import Path; sys.path.insert(0, str(Path('" + str(TOOL_ROOT) + "'))); "
-                 "from lib.system import apply_system_uninstall; from lib.state import remove_state_data, load_state; "
-                 "st = load_state(); apply_system_uninstall(st); remove_state_data(); print('OK_CLEAN')"],
+                [
+                    sys.executable,
+                    "-c",
+                    (
+                        "import sys; from pathlib import Path; sys.path.insert(0, sys.argv[1]); "
+                        "from lib.system import apply_system_uninstall; from lib.state import remove_state_data, load_state; "
+                        "st = load_state(); apply_system_uninstall(st); remove_state_data(); print('OK_CLEAN')"
+                    ),
+                    str(TOOL_ROOT),
+                ],
                 capture_output=True,
                 text=True,
                 env=dict(os.environ, **test_env),
