@@ -4,6 +4,40 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/). This p
 
 ## [Unreleased]
 
+- Add `wg-manager`: native WireGuard hub manager (networkd/NM, nftables/firewalld, QR clients, EN/ES/DE, dry-
+  run-first with rollback).
+- `wg-manager` audit hardening: real Curve25519 keys (`wg genkey`/`wg pubkey`), fail-hard render guards,
+  strict interface-name validation, idempotent and validated nftables (no injection), apply with post-verify
+  and rollback, state `flock`, DNS scope, and installer fixes (manifest via `json.dump`, `--prefix`
+  validation, `--uninstall` removes only, new `--restore`).
+- `wg-manager` console redesign: a pure, testable presentation layer (`paint`, `section`, `kv`, `table`,
+  `note`, `hint`, `items`, `emit`) replaces ad-hoc prints. Aligned peers table, grouped `show`/`check` reports
+  with ASCII `[ok]/[warn]/[fail]/[skip]/[dry-run]/[applied]/[danger]` tags, one visual grammar for the menu,
+  and a new `--width N` seam. Color stays gated (`NO_COLOR`/`--color`), piped output is plain, and every
+  chrome line fits 60/80/120 with ASCII truncation. Presentation-only: exit codes, tags/secret redaction, and
+  the `render_*` documents are unchanged; `tests/test_basic.py` adds ASCII, no-ANSI-on-pipe, width, dry-run-
+  distinct, menu-token, and i18n-parity checks.
+- `wg-manager` apply-path fixes found on a real host: post-verify now waits for the interface after a
+  `systemd-networkd` restart instead of checking immediately (the old immediate check rolled a healthy netdev
+  back), a failed apply prints a read-only diagnostics block (service state, `networkctl`, `journalctl`,
+  config-written), the state file is persisted only after a successful apply (a failed apply no longer leaves
+  a `state.json` that blocks the retry), and `init`/`reload` refuse up front when the selected backend service
+  is not running under systemd.
+- `wg-manager` peer connectivity and firewall fixes: atomic in-kernel live peer synchronization via `wg
+  syncconf` prevents `systemd-networkd` from ignoring new peers on running interfaces, clean `udp dport <port>
+  accept` in nftables eliminates UDP packet drops and conntrack fragility, NetworkManager renderer now outputs
+  `preshared-key` and keepalive, `rp_filter = 2` applied globally (`all` and `default`) to allow asymmetric
+  tunnel routes, and i18n translation parity restored.
+- `wg-manager` routing and firewall unification: unified nftables into single `table inet wg_manager` with
+  interface-scoped masquerading (`oifname != <ifname>`), automatic integration with host base filter table
+  (`table inet filter` on Arch/Debian) to prevent drop-policy collision on port 51820 and forwarding, dual
+  `IPForward=yes`/`IPv4Forwarding=yes` for universal systemd (v245-v256+) support,
+  `/etc/systemd/networkd.conf.d/80-wg-manager.conf` global forwarding drop-in, active kernel nftables
+  verification in `_post_verify`, and client traffic default upgraded to `full-tunnel` with DNS fallback.
+- `wg-manager` multi-firewall hardening: `firewalld` backend automatically assigns the WireGuard interface to
+  the `trusted` zone to eliminate inter-zone forwarding drops in firewalld >= 0.9.0; native UFW support
+  automatically allows the UDP listen port and interface routing on Debian/Ubuntu hosts, audits UFW rules in
+  `check`, and performs clean rollback on uninstall.
 - Impact levels clarified: `impact` describes what the tool changes on **your machine**. A tool that
   only calls a remote API (like `ionos-dnssec`) is `read-only`; remote effects stay documented in the
   README `Impact` section.

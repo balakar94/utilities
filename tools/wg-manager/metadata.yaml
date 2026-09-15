@@ -1,0 +1,10 @@
+name: wg-manager
+description: Native WireGuard hub manager with QR clients
+category: network-system
+owner: "@balakar94"
+status: incubating
+compat: Linux
+impact: system
+last_verified: 2026-09-14
+version: 1.0.0
+license: Apache-2.0

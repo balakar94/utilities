@@ -5,3 +5,4 @@
 | Tool | Description | Category | Status | Owner |
 |---|---|---|---|---|
 | `ionos‑dnssec` | Create, update and delete DNSSEC DS records for IONOS DNS zones | network‑system | incubating | @balakar94 |
+| `wg‑manager` | Native WireGuard hub manager with QR clients | network‑system | incubating | @balakar94 |
