@@ -60,7 +60,7 @@ pwsh tools/<name>/tests/test_basic.ps1         # native test (powershell tool)
 ```
 
 Both twins must agree: they validate the same contract and generate the same `TOOLS.md`.
-CI cross-checks this on Linux and Windows. Per-tool tests are native to each entrypoint.
+CI cross-checks this on Linux, macOS, and Windows. Per-tool tests are native to each entrypoint.
 
 CI must pass with 0 tools (empty discovery = success, not failure).
 

@@ -44,8 +44,9 @@ First-class (the four): `bash` (`main.sh`), `python` (`main.py`, >= 3.11),
   Native tests are plain scripts with no skip path; CI always has all four runtimes.
 - Each tool ships ONE test, native to its entrypoint: `main.sh` → `tests/test_basic.sh`,
   `main.py` → `tests/test_basic.py`, `main.ps1` → `tests/test_basic.ps1`,
-  `main.rb` → `tests/test_basic.rb`. CI runs it on every OS with that runtime (`main.sh` on Linux,
-  `main.ps1` on Windows, `main.py`/`main.rb` on both). See `docs/adr/0002-per-language-tests.md`.
+  `main.rb` → `tests/test_basic.rb`. CI runs it on every OS runner that matches its `compat`
+  declaration (`main.sh` on Linux, `main.ps1` on Windows, `main.py`/`main.rb` on runners
+  matching `compat`). See `docs/adr/0002-per-language-tests.md` and `docs/adr/0003-os-compat-in-ci-smoke.md`.
 - `examples/` is optional. If present, it must contain `basic.<ext>` matching the entrypoint.
 - The repo scripts still ship both twins: `scripts/*.sh` and `scripts/*.ps1`. They validate the same
   contract and must generate byte-identical `TOOLS.md`; CI cross-checks this on both OSes.

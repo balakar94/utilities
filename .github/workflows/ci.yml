@@ -112,6 +112,63 @@ jobs:
           for d in "${dirs[@]}"; do
             slug="$(basename "$d")"
             case "$slug" in _archived|archived) continue;; esac
+            meta="$d/metadata.yaml"
+            compat=""
+            if [ -f "$meta" ]; then
+              compat="$(sed -n 's/^compat:[[:space:]]*//p' "$meta" | tr -d '"'\''')"
+            fi
+            if [ -n "$compat" ] && ! echo "$compat" | grep -Eiq 'all|linux'; then
+              echo "== $slug: skipped on Linux (compat: $compat)"
+              continue
+            fi
+            entry=""
+            for m in sh py ps1 rb; do
+              if [ -f "$d/main.$m" ]; then entry="$m"; break; fi
+            done
+            case "$entry" in
+              sh) runner="bash"; tests="$d/tests/test_basic.sh"; example="$d/examples/basic.sh" ;;
+              py) runner="python3"; tests="$d/tests/test_basic.py"; example="$d/examples/basic.py" ;;
+              rb) runner="ruby"; tests="$d/tests/test_basic.rb"; example="$d/examples/basic.rb" ;;
+              ps1) echo "== $slug: PowerShell tool, covered on windows-latest"; continue ;;
+              *) echo "missing entrypoint: $slug"; fail=1; continue ;;
+            esac
+            echo "== $tests"
+            "$runner" "$tests" || fail=1
+            if [ -f "$example" ]; then
+              echo "== $example"
+              "$runner" "$example" || fail=1
+            fi
+          done
+          exit "$fail"
+
+  smoke-macos:
+    name: "Smoke: macOS"
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - name: metadata check
+        run: bash scripts/list-tools.sh --check
+      - name: per-language smoke tests + examples (bash/py/rb)
+        run: |
+          shopt -s nullglob
+          dirs=(tools/*/)
+          if [ ${#dirs[@]} -eq 0 ]; then
+            echo "no tools found (OK with 0 tools)"
+            exit 0
+          fi
+          fail=0
+          for d in "${dirs[@]}"; do
+            slug="$(basename "$d")"
+            case "$slug" in _archived|archived) continue;; esac
+            meta="$d/metadata.yaml"
+            compat=""
+            if [ -f "$meta" ]; then
+              compat="$(sed -n 's/^compat:[[:space:]]*//p' "$meta" | tr -d '"'\''')"
+            fi
+            if [ -n "$compat" ] && ! echo "$compat" | grep -Eiq 'all|macos|darwin'; then
+              echo "== $slug: skipped on macOS (compat: $compat)"
+              continue
+            fi
             entry=""
             for m in sh py ps1 rb; do
               if [ -f "$d/main.$m" ]; then entry="$m"; break; fi
@@ -154,6 +211,18 @@ jobs:
             Where-Object { $_.Name -ne '_archived' -and $_.Name -ne 'archived' }
           if (-not $dirs) { Write-Host 'no tools found (OK with 0 tools)'; exit 0 }
           foreach ($d in $dirs) {
+            $meta = Join-Path $d.FullName 'metadata.yaml'
+            $compat = ''
+            if (Test-Path -LiteralPath $meta) {
+              $pattern = '^compat:\s*(.*)$'
+              foreach ($line in (Get-Content -LiteralPath $meta)) {
+                if ($line -match $pattern) { $compat = $matches[1].Trim().Trim('"').Trim("'"); break }
+              }
+            }
+            if ($compat -and ($compat -notmatch '(?i)all|windows')) {
+              Write-Host "== $($d.Name): skipped on Windows (compat: $compat)"
+              continue
+            }
             $runner = $null; $ext = $null
             if (Test-Path -LiteralPath (Join-Path $d.FullName 'main.ps1')) { $runner = 'pwsh'; $ext = 'ps1' }
             elseif (Test-Path -LiteralPath (Join-Path $d.FullName 'main.py')) { $runner = 'python'; $ext = 'py' }
