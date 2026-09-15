@@ -12,7 +12,9 @@ ENTRY = Path(__file__).resolve().parent.parent / "main.py"
 
 
 def run(*args):
-    return subprocess.run([sys.executable, str(ENTRY), *args]).returncode
+    return subprocess.run(
+        [sys.executable, str(ENTRY), *args], check=False
+    ).returncode
 
 
 def main():
