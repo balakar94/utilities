@@ -23,7 +23,7 @@ from .renderers import (
     render_sysctl,
     render_wg_syncconf,
 )
-from .state import _mkdir_private, _rotate_backups, atomic_write, state_dir
+from .state import _mkdir_private, atomic_write, state_dir
 from .validators import validate_ifname, validate_nft_content
 
 
@@ -33,13 +33,29 @@ def _sp(path):
 
 
 def require_apply(args, cmd):
-    """Enforce dry-run default; privileged writes need --apply --yes --sudo."""
+    """Enforce dry-run default; privileged writes need --apply --yes --sudo.
+
+    `--dry-run` always wins, even when combined with `--apply`, so a preview
+    can never escalate into a write by accident.
+    """
+    if getattr(args, "dry_run", False):
+        emit(note(t("msg_dry_run"), "dryrun", args, indent=1))
+        return False
     if not getattr(args, "apply", False):
         emit(note(t("msg_dry_run"), "dryrun", args, indent=1))
         return False
     if not getattr(args, "yes", False):
         emit(note(t("err_need_apply_yes"), "err", args, indent=1), stream="err")
         raise SystemExit(2)
+    if SYSROOT:
+        # Test seam: every system path is already redirected under SYSROOT
+        # (and firewall execution is skipped), so a sandboxed apply does not
+        # need root. Production never defines this variable. The environment
+        # check keeps the seam out of reach of a stray env var in production.
+        if os.environ.get("WG_MANAGER_ALLOW_SYSROOT_APPLY") == "1":
+            return True
+        emit(note(t("err_need_root").format(cmd=cmd), "err", args, indent=1), stream="err")
+        raise SystemExit(1)
     try:
         euid = os.geteuid()
     except AttributeError:
@@ -52,7 +68,13 @@ def require_apply(args, cmd):
         if not sudo:
             emit(note(t("err_need_root").format(cmd=cmd), "err", args, indent=1), stream="err")
             raise SystemExit(1)
-        os.execvp(sudo, [sudo, sys.executable, os.path.abspath(__file__)] + sys.argv[1:])
+        # Re-exec the real entrypoint (repo main.py or the installed zipapp),
+        # never this library module.
+        entry = os.path.abspath(sys.argv[0] or "")
+        if not entry or not os.path.exists(entry):
+            emit(note(t("err_need_root").format(cmd=cmd), "err", args, indent=1), stream="err")
+            raise SystemExit(1)
+        os.execvp(sudo, [sudo, sys.executable, entry] + sys.argv[1:])
     return True
 
 
@@ -126,7 +148,7 @@ def _precheck_backend(backend):
     inactive writes files, fails post-verify and rolls everything back, which
     looks like a mysterious 'interface missing' failure.
     """
-    if not _systemd_is_init():
+    if SYSROOT or not _systemd_is_init():
         return
     ctl = shutil.which("systemctl")
     if not ctl:
@@ -134,6 +156,44 @@ def _precheck_backend(backend):
     svc = _backend_service(backend)
     if not _is_service_active(ctl, svc):
         raise ValueError(t("err_backend_inactive").format(backend=backend, svc=svc))
+
+
+def _precheck_firewall(firewall):
+    """Fail fast when the selected firewall engine cannot be applied."""
+    if firewall == "firewalld":
+        if not SYSROOT and not shutil.which("firewall-cmd"):
+            raise ValueError(t("err_firewall_unavailable").format(engine="firewalld", binary="firewall-cmd"))
+    elif not SYSROOT and not shutil.which("nft"):
+        raise ValueError(t("err_firewall_unavailable").format(engine="nft", binary="nft"))
+
+
+_SYSCTL_ORIGINAL_KEYS = (
+    "net.ipv4.ip_forward",
+    "net.ipv4.conf.all.rp_filter",
+    "net.ipv4.conf.default.rp_filter",
+    "net.ipv6.conf.all.forwarding",
+)
+
+
+def snapshot_sysctl_original(state):
+    """Record live sysctl values once, so uninstall can restore the host.
+
+    Reads the real /proc/sys (read-only); the SYSROOT seam only affects where
+    files are written, and uninstall never writes sysctl under SYSROOT.
+    """
+    srv = state.setdefault("server", {})
+    if not isinstance(srv, dict) or srv.get("sysctl_original"):
+        return
+    original = {}
+    for key in _SYSCTL_ORIGINAL_KEYS:
+        path = Path("/proc/sys/" + key.replace(".", "/"))
+        try:
+            if path.exists():
+                original[key] = path.read_text(encoding="utf-8").strip()
+        except OSError:
+            continue
+    if original:
+        srv["sysctl_original"] = original
 
 
 def _systemd_network_gid():
@@ -240,8 +300,32 @@ def detect_net_backend():
         return ("networkd", "family-default")
 
 
+def _rotate_system_backups(bdir, keep=20):
+    """Rotate sys-* backups as pairs (file + .mode sidecar), keeping `keep` files."""
+    try:
+        files = [p for p in sorted(Path(bdir).glob("sys-*")) if not p.name.endswith(".mode")]
+    except OSError:
+        return
+    for old in files[:-keep]:
+        try:
+            old.unlink()
+        except OSError:
+            pass
+        sidecar = Path(str(old) + ".mode")
+        try:
+            if sidecar.exists():
+                sidecar.unlink()
+        except OSError:
+            pass
+
+
 def backup_system_file(path):
-    """Backup existing file to backups/sys-<ts>-<pid>-<basename> (rotate 20)."""
+    """Backup an existing file to backups/sys-<ts>-<pid>-<basename> (rotate 20).
+
+    A `<backup>.mode` sidecar remembers the original permissions so rollback
+    restores 0644 configs as 0644 while the backup itself stays 0600 (it may
+    contain private keys).
+    """
     p = Path(path)
     try:
         if not p.exists() or not p.is_file():
@@ -250,13 +334,24 @@ def backup_system_file(path):
         _mkdir_private(bdir)
         stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
         dest = bdir / ("sys-" + stamp + "-" + str(os.getpid()) + "-" + p.name)
+        try:
+            original_mode = p.stat().st_mode & 0o7777
+        except OSError:
+            original_mode = None
         shutil.copy2(str(p), str(dest))
         try:
             os.chmod(dest, 0o600)
         except OSError:
             pass
+        if original_mode is not None:
+            try:
+                sidecar = Path(str(dest) + ".mode")
+                sidecar.write_text(oct(original_mode) + "\n", encoding="ascii")
+                os.chmod(sidecar, 0o600)
+            except OSError:
+                pass
         print(t("sys_backup").format(path=str(p), backup=str(dest)))
-        _rotate_backups(bdir, "sys-*", 20)
+        _rotate_system_backups(bdir, 20)
         return dest
     except OSError:
         return None
@@ -384,8 +479,28 @@ def _verify_iface(ifname, tries=1, delay=0.0):
     return False
 
 
-def _post_verify(state, ifname, firewall="nftables", tries=1, delay=0.0):
+def _sysctl_exe():
+    """sysctl binary usable in this environment (never the host one under SYSROOT)."""
+    exe = shutil.which("sysctl")
+    if not exe:
+        return None
+    if SYSROOT and not Path(_sp("/proc/sys")).exists():
+        return None
+    return exe
+
+
+def _post_verify(state, ifname, backend="networkd", firewall="nftables", tries=1, delay=0.0):
     """Audit fix: C5 - return a failure reason or None when the apply is healthy."""
+    if SYSROOT:
+        # Sandboxed/test apply: the live kernel is out of scope, so verify the
+        # staged configuration files instead of an interface that cannot exist.
+        if backend == "nm":
+            expected = _sp("/etc/NetworkManager/system-connections/wg-manager.nmconnection")
+        else:
+            expected = _sp("/etc/systemd/network/90-" + ifname + ".netdev")
+        if not Path(expected).exists():
+            return "staged config " + expected + " missing"
+        return None
     if not _verify_iface(ifname, tries=tries, delay=delay):
         return "interface " + ifname + " missing"
     wg = shutil.which("wg")
@@ -462,12 +577,23 @@ def format_handshake_age(epoch_secs, now_secs):
 
 
 
+def _restore_backup_mode(path, backup):
+    """Re-apply the original mode recorded by backup_system_file."""
+    sidecar = Path(str(backup) + ".mode")
+    try:
+        if sidecar.exists():
+            os.chmod(str(path), int(sidecar.read_text(encoding="ascii").strip(), 8))
+    except (OSError, ValueError):
+        pass
+
+
 def _rollback_paths(entries):
     """Audit fix: C5 - restore backups in reverse order, or remove new files."""
     for path, backup in reversed(entries):
         try:
             if backup is not None and Path(backup).exists():
                 shutil.copy2(str(backup), str(path))
+                _restore_backup_mode(path, backup)
             elif Path(path).exists():
                 os.unlink(str(path))
         except OSError as exc:
@@ -476,9 +602,16 @@ def _rollback_paths(entries):
 
 def apply_system_reload(state, backend, firewall, args=None):
     """Audit fix: C5 - precheck, write, verify and rollback system resources."""
-    # 1. Hard prechecks: invalid key material or names abort before any write.
+    # 0. Persisted choices win over detection, so `reload --backend/--firewall`
+    #    stays effective for every later command.
+    srv = state.get("server", {}) if isinstance(state, dict) else {}
+    backend = str(srv.get("backend") or "") or backend
+    firewall = str(srv.get("firewall") or "") or firewall
+    # 1. Hard prechecks: invalid key material, names or a missing firewall
+    #    engine abort before any write.
     validate_key_material(state)
     _precheck_backend(backend)
+    _precheck_firewall(firewall)
     srv = state.get("server", {})
     ifname = str(srv.get("ifname", "wg0") or "wg0")
     validate_ifname(ifname)
@@ -526,6 +659,7 @@ def apply_system_reload(state, backend, firewall, args=None):
             (_sp("/etc/systemd/networkd.conf.d/80-wg-manager.conf"), netd_conf, 0o644, None),
         ]
     sysctl_content = render_sysctl(state)
+    snapshot_sysctl_original(state)
     written = []
     # 3. Backups + atomic writes (all tracked for rollback).
     try:
@@ -565,14 +699,17 @@ def apply_system_reload(state, backend, firewall, args=None):
         wg = shutil.which("wg")
         if wg and _verify_iface(ifname):
             sync_content = render_wg_syncconf(state, show_secrets=True)
-            with tempfile.NamedTemporaryFile("w", suffix=".conf", delete=False) as tf:
-                tf.write(sync_content)
-                tmp_path = tf.name
+            # Keep private keys out of world-readable /tmp: write 0600 inside
+            # the state directory and unlink immediately after use.
+            _mkdir_private(state_dir())
+            fd, tmp_path = tempfile.mkstemp(prefix=".syncconf-", suffix=".conf", dir=str(state_dir()))
             try:
                 try:
-                    os.chmod(tmp_path, 0o600)
+                    os.fchmod(fd, 0o600)
                 except OSError:
                     pass
+                with os.fdopen(fd, "w", encoding="utf-8") as tf:
+                    tf.write(sync_content)
                 rc, _out, _err = _run_capture([wg, "syncconf", ifname, tmp_path])
                 if rc == 0:
                     synced = True
@@ -597,7 +734,7 @@ def apply_system_reload(state, backend, firewall, args=None):
                     _run_best_effort([ctl, "restart", "systemd-networkd"])
                     _verify_iface(ifname, tries=20, delay=0.5)
     # 5. sysctl after the interface exists so per-iface keys apply.
-    ctl_sys = shutil.which("sysctl")
+    ctl_sys = _sysctl_exe()
     if ctl_sys:
         _run_best_effort([ctl_sys, "--system"])
     # 6. Firewall (validated/rendered earlier).
@@ -612,7 +749,13 @@ def apply_system_reload(state, backend, firewall, args=None):
             _clean_host_filter_rules(exe)
             rc, _out, err = _run_capture([exe, "-f", nft_file])
             if rc not in (0, None):
+                # A rejected ruleset is a failed apply: roll back files and the
+                # live ruleset instead of reporting success.
                 eprint(err.strip() or "nft apply failed")
+                _rollback_paths(written)
+                if Path(nft_file).exists():
+                    _run_best_effort([exe, "-f", nft_file])
+                return False
         # Internal host firewall support: if UFW is active on Debian/Ubuntu, allow WireGuard port and routing.
         ufw = shutil.which("ufw")
         if ufw:
@@ -622,7 +765,7 @@ def apply_system_reload(state, backend, firewall, args=None):
                 _run_best_effort([ufw, "allow", str(port) + "/udp", "comment", "wg-manager"])
                 _run_best_effort([ufw, "route", "allow", "in", "on", ifname])
     # 7. Post-verify: rollback on any failure.
-    reason = _post_verify(state, ifname, firewall=firewall, tries=20, delay=0.5)
+    reason = _post_verify(state, ifname, backend=backend, firewall=firewall, tries=20, delay=0.5)
     if reason:
         emit(_net_diagnostics(ifname, backend, args))
         _rollback_paths(written)
@@ -639,7 +782,7 @@ def apply_system_reload(state, backend, firewall, args=None):
                 else:
                     for tbl in ("inet wg_manager", "ip wg_manager_nat4", "ip6 wg_manager_nat6"):
                         _run_best_effort([exe, "delete", "table"] + tbl.split())
-        ctl_sys = shutil.which("sysctl")
+        ctl_sys = _sysctl_exe()
         if ctl_sys:
             _run_best_effort([ctl_sys, "--system"])
         if backend == "nm":
@@ -740,7 +883,8 @@ def apply_system_uninstall(state, args=None):
     if ctl and _systemd_is_init():
         _run_best_effort([ctl, "restart", "systemd-networkd"])
 
-    # 4. sysctl cleanup
+    # 4. sysctl cleanup: remove our file and restore the values captured at
+    #    first apply, so uninstall really leaves the host as it was.
     sysctl_conf = Path(_sp("/etc/sysctl.d/90-wg-manager.conf"))
     if sysctl_conf.exists():
         try:
@@ -748,9 +892,14 @@ def apply_system_uninstall(state, args=None):
             removed.append(str(sysctl_conf))
         except OSError:
             pass
-        ctl_sys = shutil.which("sysctl")
-        if ctl_sys:
-            _run_best_effort([ctl_sys, "--system"])
+    ctl_sys = _sysctl_exe()
+    if ctl_sys:
+        _run_best_effort([ctl_sys, "--system"])
+        original = srv.get("sysctl_original") if isinstance(srv, dict) else None
+        if isinstance(original, dict):
+            for key, value in original.items():
+                if re.match(r"^net\.[a-z0-9_.]+$", str(key)) and re.match(r"^-?\d+$", str(value)):
+                    _run_best_effort([ctl_sys, "-w", str(key) + "=" + str(value)])
 
     # 5. firewall cleanup (nftables and firewalld)
     nft_file = Path(_sp("/etc/nftables.d/90-wg-manager.nft"))
@@ -788,8 +937,16 @@ def apply_system_uninstall(state, args=None):
     fw_cmd = shutil.which("firewall-cmd")
     if fw_cmd:
         port = srv.get("port", 51820)
+        v4prefix = str(state.get("ipv4", {}).get("prefix", "") or "")
+        v6prefix = str(state.get("ipv6", {}).get("prefix", "") or "")
+        v6mode = str(state.get("ipv6", {}).get("mode", "disabled") or "disabled")
         _run_best_effort([fw_cmd, "--permanent", "--zone=trusted", "--remove-interface=" + str(ifname)])
         _run_best_effort([fw_cmd, "--permanent", "--remove-port=" + str(port) + "/udp"])
+        _run_best_effort([fw_cmd, "--permanent", "--remove-masquerade"])
+        if v4prefix:
+            _run_best_effort([fw_cmd, "--permanent", "--remove-rich-rule", 'rule family="ipv4" source address="' + v4prefix + '" masquerade'])
+        if v6mode == "nat66" and v6prefix:
+            _run_best_effort([fw_cmd, "--permanent", "--remove-rich-rule", 'rule family="ipv6" source address="' + v6prefix + '" masquerade'])
         _run_best_effort([fw_cmd, "--permanent", "--direct", "--remove-rule", "ipv4", "filter", "FORWARD", "0", "-p", "tcp", "--tcp-flags", "SYN,RST", "SYN", "-j", "TCPMSS", "--clamp-mss-to-pmtu"])
         _run_best_effort([fw_cmd, "--permanent", "--direct", "--remove-rule", "ipv6", "filter", "FORWARD", "0", "-p", "tcp", "--tcp-flags", "SYN,RST", "SYN", "-j", "TCPMSS", "--clamp-mss-to-pmtu"])
         _run_best_effort([fw_cmd, "--reload"])

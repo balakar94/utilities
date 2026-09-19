@@ -84,6 +84,19 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/). This p
   `list-tools` twins validate it.
 - Removed `.pre-commit-config.yaml` (it was never installed and only duplicated CI).
 
+### wg-manager
+
+- CLI and safety fixes: `--sudo` re-executes the real entrypoint, `--dry-run`
+  prevails over `--apply`, the TUI has an explicit mode with destructive-action
+  confirmations, infra-peer `edit` redacts secrets, `check` returns a real exit
+  code and supports `--json`, `rollback` re-applies networking, and `reload`
+  persists the backend/firewall state.
+- State, storage and packaging: validated state with migrations, lock with
+  timeout, unified backups and `audit.log` rotation, atomic `export` without
+  symlinks, atomic installer with manifest and hash, and sysctl restored on
+  uninstall.
+- New fake-backed test suite; README examples corrected.
+
 ## [0.1.0] - 2026-09-12
 
 ### Added

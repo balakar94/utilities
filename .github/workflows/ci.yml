@@ -62,6 +62,46 @@ jobs:
         with:
           python-version: "3.11"
       - run: git ls-files '*.py' | xargs -r -n1 python3 -m py_compile
+      - name: "ruff check (pinned)"
+        run: |
+          python3 -m pip install --disable-pip-version-check "ruff==0.16.7"
+          # Scoped to tools/wg-manager: the repo-wide check reports 3 pre-existing
+          # warnings in templates/tool-template (EXE001 x2, PLW1510), out of scope.
+          # Empty file list = 0-tools baseline, keep it green (no lint run).
+          git ls-files -z 'tools/wg-manager/*.py' | xargs -0 -r ruff check
+
+  wg-manager-integration:
+    name: "wg-manager: Linux integration"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - name: Install WireGuard/nftables runtime
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends wireguard-tools nftables iproute2
+      - name: Smoke test, example and self-test
+        run: |
+          python3 tools/wg-manager/tests/test_basic.py
+          python3 tools/wg-manager/examples/basic.py
+          python3 tools/wg-manager/main.py --self-test
+      - name: Installer dry-run (non-root, writes nothing)
+        run: bash tools/wg-manager/install.sh --prefix "$RUNNER_TEMP/wgm-prefix" --apply --yes --dry-run
+      - name: Installer apply/uninstall smoke (pinned disposable container)
+        # install.sh apply requires uid 0 (or --sudo); this job must not use
+        # host sudo, so the atomic build+install+uninstall flow runs as root
+        # inside a pinned, throwaway Ubuntu container.
+        run: |
+          docker run --rm -v "$GITHUB_WORKSPACE:/src:ro" \
+            ubuntu:24.04@sha256:008173c23f95b170204355c12626cb5a965d779a7e1283b09e9cffbb1bf33ca3 \
+            bash -eu -c '
+              export DEBIAN_FRONTEND=noninteractive
+              apt-get update -qq
+              apt-get install -y -qq --no-install-recommends python3
+              bash /src/tools/wg-manager/install.sh --prefix /opt/wgm-prefix --apply --yes
+              /opt/wgm-prefix/bin/wg-manager --version
+              /opt/wgm-prefix/bin/wg-manager --self-test
+              bash /src/tools/wg-manager/install.sh --prefix /opt/wgm-prefix --uninstall --apply --yes
+              test ! -e /opt/wgm-prefix/bin/wg-manager
+            '
 
   ruby:
     name: "Ruby: syntax"

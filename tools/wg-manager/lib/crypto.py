@@ -5,8 +5,8 @@ import shutil
 import subprocess
 
 from .constants import WGKEY_RE
+from .errors import WgError
 from .i18n import t
-from .presentation import eprint
 
 
 def _server_pubkey(state): return (state.get("server", {}) or {}).get("public_key", "")
@@ -21,8 +21,7 @@ def is_valid_wgkey(value):
 def _wg_bin():
     exe = shutil.which("wg")
     if not exe:
-        eprint(t("err_no_wg"))
-        raise SystemExit(1)
+        raise WgError(t("err_no_wg"))
     return exe
 
 
@@ -32,12 +31,10 @@ def wggen():
     try:
         proc = subprocess.run([exe, "genkey"], capture_output=True, text=True, timeout=15, check=False)
     except (OSError, subprocess.SubprocessError) as exc:
-        eprint(str(exc))
-        raise SystemExit(1)
+        raise WgError(str(exc))
     key = (proc.stdout or "").strip()
     if proc.returncode != 0 or not is_valid_wgkey(key):
-        eprint(t("err_no_wg"))
-        raise SystemExit(1)
+        raise WgError(t("err_no_wg"))
     return key
 
 
@@ -49,12 +46,10 @@ def wgpub(privkey):
             [exe, "pubkey"], input=str(privkey), capture_output=True, text=True, timeout=15, check=False
         )
     except (OSError, subprocess.SubprocessError) as exc:
-        eprint(str(exc))
-        raise SystemExit(1)
+        raise WgError(str(exc))
     key = (proc.stdout or "").strip()
     if proc.returncode != 0 or not is_valid_wgkey(key):
-        eprint(t("err_no_wg"))
-        raise SystemExit(1)
+        raise WgError(t("err_no_wg"))
     return key
 
 

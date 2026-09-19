@@ -13,9 +13,21 @@ FORCE=0
 UNINSTALL=0
 RESTORE=0
 DRYRUN=0
+PRIV=""
+TMP=""
 usage() {
-  printf '%s\n' "Usage: bash install.sh [options]" "  --prefix PATH  install prefix (default /usr/local, binary=PREFIX/bin/wg-manager)" "  --apply --yes --sudo  gated apply (default is dry-run, changes nothing)" "  --force  overwrite identical version; --uninstall removes binary only" "  --restore  reinstall the latest .bak backup of the binary" "  --dry-run  explicit dry-run; --help  show this help" "Scope: packages + binary only. Mode 0755 in all cases."
+  printf '%s\n' "Usage: bash install.sh [options]" "  --prefix PATH  install prefix (default /usr/local, binary=PREFIX/bin/wg-manager)" "  --apply --yes --sudo  gated apply (default is dry-run, changes nothing)" "  --force  overwrite identical version; --uninstall removes binary and manifest" "  --restore  verify and reinstall the latest .bak backup of the binary" "  --dry-run  explicit dry-run; --help  show this help" "Scope: packages + binary only. Build is staged and verified before replacing the binary."
 }
+# Remove the staging file on any exit path, including INT/TERM/HUP.
+cleanup_tmp() {
+  if [ -n "${TMP:-}" ] && [ -e "$TMP" ]; then
+    ${PRIV:-} rm -f "$TMP" 2> /dev/null || true
+  fi
+}
+trap cleanup_tmp EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap 'exit 129' HUP
 # Argument parsing (bash 3.2 compatible, no associative arrays).
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -90,6 +102,14 @@ case "$PREFIX" in
     exit 2
     ;;
 esac
+# Audit fix: reject '..' path components. Wrapping the prefix in slashes makes
+# every component boundary a slash, so only a literal '..' component matches.
+case "/$PREFIX/" in
+  */../*)
+    echo "ERROR: --prefix must not contain '..' path components (got: $PREFIX)." >&2
+    exit 2
+    ;;
+esac
 case "$PREFIX" in
   *[!A-Za-z0-9._/+:-]*)
     echo "ERROR: --prefix contains unsafe characters: $PREFIX" >&2
@@ -126,7 +146,7 @@ if [ -f /etc/os-release ]; then
       ;;
   esac
 fi
-# Packages pinned via distro repos only, no external repos.
+# Packages come from distro repos only (no external repos) and are not version-pinned.
 case "$PKG_MGR" in
   apt) PKGS="python3 wireguard-tools qrencode nftables iproute2" ;;
   pacman) PKGS="python wireguard-tools qrencode nftables iproute2" ;;
@@ -140,22 +160,38 @@ if [ ! -f "$SRC" ]; then
   echo "ERROR: source not found: $SRC" >&2
   exit 1
 fi
+# Audit fix: python3 is required to read the version, build the zipapp and verify it.
+if ! command -v python3 > /dev/null 2>&1; then
+  echo "ERROR: python3 not found; install python3 first (required to read the source version and build the manager)." >&2
+  exit 1
+fi
 SRC_VER="$(python3 "$SRC" --version 2> /dev/null | sed 's/.* //')"
 if [ -z "${SRC_VER:-}" ]; then
   echo "ERROR: cannot read source version." >&2
   exit 1
 fi
 INST_VER="none"
-if [ -x "$BIN" ]; then INST_VER="$("$BIN" --version 2> /dev/null | sed 's/.* //')"; fi
+if [ -x "$BIN" ]; then INST_VER="$("$BIN" --version 2> /dev/null | sed 's/.* //' || true)"; fi
 if [ -x "$BIN" ] && [ -z "${INST_VER:-}" ]; then INST_VER="corrupt"; fi
 BACKUP="$BIN.bak.$TS"
 if [ -e "$BACKUP" ]; then BACKUP="$BACKUP.$$"; fi
+# Audit fix: sha256 helper for the manifest (sha256sum on Linux, shasum on macOS); "" if neither exists.
+file_sha256() {
+  if command -v sha256sum > /dev/null 2>&1; then
+    sha256sum "$1" | cut -d' ' -f1
+  elif command -v shasum > /dev/null 2>&1; then
+    shasum -a 256 "$1" | cut -d' ' -f1
+  else
+    printf ''
+  fi
+}
 # Latest backup by modification time is unreliable across copies; the timestamp
 # name sorts lexicographically because it is zero-padded YYYYmmddHHMMSS.
 if [ "$UNINSTALL" -eq 1 ]; then
   if [ "$APPLY" -eq 0 ]; then
     echo "PLAN: uninstall $BIN (dry-run, changes nothing). Installed: $INST_VER."
-    echo "PLAN: removes the binary only; packages, services and state are untouched."
+    echo "PLAN: removes the binary and the install manifest if present: $MANIFEST"
+    echo "PLAN: packages, services and state under /etc/wg-manager are NOT touched."
     exit 0
   fi
   if [ "$YES" -eq 0 ]; then
@@ -176,13 +212,18 @@ if [ "$UNINSTALL" -eq 1 ]; then
   fi
   # Audit fix: A9 - uninstall only removes; use --restore to bring a backup back.
   $PRIV rm -f "$BIN"
-  echo "Uninstalled $BIN (packages, services, state untouched)."
+  if $PRIV test -e "$MANIFEST"; then
+    $PRIV rm -f "$MANIFEST"
+    echo "Removed manifest $MANIFEST."
+  fi
+  echo "Uninstalled $BIN (packages, services and /etc/wg-manager state untouched)."
   exit 0
 fi
 if [ "$RESTORE" -eq 1 ]; then
   LATEST="$(ls -1 "$BIN".bak.* 2> /dev/null | sort | tail -n 1 || true)"
   if [ "$APPLY" -eq 0 ]; then
     echo "PLAN: restore ${LATEST:-none} to $BIN (dry-run, changes nothing)."
+    echo "PLAN: verify --version and --self-test on a staging copy before replacing $BIN."
     exit 0
   fi
   if [ "$YES" -eq 0 ]; then
@@ -205,9 +246,22 @@ if [ "$RESTORE" -eq 1 ]; then
     }
     PRIV="sudo -n"
   fi
-  $PRIV cp -p "$LATEST" "$BIN"
-  $PRIV chmod 0755 "$BIN"
-  echo "Restored $LATEST to $BIN."
+  # Audit fix: stage the backup next to BIN and verify it before replacing anything.
+  $PRIV mkdir -p "$PREFIX/bin"
+  TMP="$($PRIV mktemp "$PREFIX/bin/.wg-manager.restore.XXXXXX")"
+  if ! $PRIV cp -p "$LATEST" "$TMP"; then
+    echo "ERROR: cannot copy backup $LATEST." >&2
+    exit 1
+  fi
+  REST_VER="$($PRIV python3 "$TMP" --version 2> /dev/null | sed 's/.* //' || true)"
+  if [ -z "${REST_VER:-}" ] || ! $PRIV python3 "$TMP" --self-test > /dev/null 2>&1; then
+    echo "ERROR: backup $LATEST failed verification; keeping current $BIN." >&2
+    exit 1
+  fi
+  $PRIV chmod 0755 "$TMP"
+  $PRIV mv -f "$TMP" "$BIN"
+  if [ "$SELINUX" = "yes" ] && command -v restorecon > /dev/null 2>&1; then $PRIV restorecon -v "$BIN" 2> /dev/null || true; fi
+  echo "Restored $LATEST to $BIN (version $REST_VER, self-test pass)."
   exit 0
 fi
 if [ "$INST_VER" = "$SRC_VER" ] && [ "$FORCE" -eq 0 ]; then
@@ -216,10 +270,11 @@ if [ "$INST_VER" = "$SRC_VER" ] && [ "$FORCE" -eq 0 ]; then
 fi
 echo "PLAN: source $SRC_VER ($SRC), installed $INST_VER."
 echo "PLAN: manager $PKG_MGR (tier $TIER), packages: $PKGS."
+echo "PLAN: packages come from distro repos, not version-pinned; no external repos are added."
 if [ "$PKG_MGR" = "pacman" ]; then echo "PLAN: pacman DB refresh (-Sy) is operator responsibility on rolling hosts; installer runs -S --needed only."; fi
-echo "PLAN: deploy standalone zipapp from $SCRIPT_DIR to $BIN with mode 0755."
-if [ -x "$BIN" ]; then echo "PLAN: backup $BIN to $BACKUP with mode 0600."; else echo "PLAN: fresh install, no backup."; fi
-echo "PLAN: SELinux restorecon: $SELINUX. Verify --version plus --self-test. Manifest: $MANIFEST."
+echo "PLAN: build zipapp to a staging file in $PREFIX/bin, verify --version/--self-test, then swap into $BIN."
+if [ -x "$BIN" ]; then echo "PLAN: backup $BIN to $BACKUP with mode 0600 before the swap."; else echo "PLAN: fresh install, no backup."; fi
+echo "PLAN: SELinux restorecon: $SELINUX. Manifest schema_version 1: $MANIFEST."
 if [ "$APPLY" -eq 0 ]; then
   echo "Dry-run: changes nothing. Re-run with --apply --yes [--sudo]."
   exit 0
@@ -240,15 +295,11 @@ if [ "$(id -u)" -ne 0 ]; then
   }
   PRIV="sudo -n"
 fi
-HAD_FILE=0
-if [ -e "$BIN" ]; then
-  HAD_FILE=1
-  $PRIV cp -p "$BIN" "$BACKUP"
-  $PRIV chmod 0600 "$BACKUP"
-fi
+# Packages first: a package failure leaves $BIN untouched.
+export DEBIAN_FRONTEND=noninteractive
 case "$PKG_MGR" in
-  apt) $PRIV apt-get update && $PRIV apt-get install -y $PKGS ;;
-  dnf) $PRIV dnf install -y $PKGS ;;
+  apt) $PRIV apt-get update && $PRIV env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends $PKGS ;;
+  dnf) $PRIV dnf install -y --setopt=install_weak_deps=False $PKGS ;;
   pacman) $PRIV pacman -S --needed --noconfirm $PKGS ;;
   *)
     echo "ERROR: unsupported distro for apply." >&2
@@ -257,8 +308,9 @@ case "$PKG_MGR" in
 esac
 # Audit fix: N16 - install(1) does not create parent dirs; create the prefix.
 $PRIV mkdir -p "$PREFIX/bin"
-# Build standalone executable zipapp from source tree
-$PRIV python3 - "$SCRIPT_DIR" "$BIN" << 'PYEOF'
+# Audit fix: N16 - stage the zipapp in the target directory (same filesystem) and verify it first.
+TMP="$($PRIV mktemp "$PREFIX/bin/.wg-manager.build.XXXXXX")"
+$PRIV python3 - "$SCRIPT_DIR" "$TMP" << 'PYEOF'
 import sys, tempfile, shutil, zipapp
 from pathlib import Path
 
@@ -277,9 +329,29 @@ with tempfile.TemporaryDirectory() as tmpdir:
         interpreter="/usr/bin/env python3"
     )
 PYEOF
-$PRIV chmod 0755 "$BIN"
+$PRIV chmod 0600 "$TMP"
+TMP_VER="$($PRIV python3 "$TMP" --version 2> /dev/null | sed 's/.* //' || true)"
+if [ "$TMP_VER" != "$SRC_VER" ]; then
+  echo "ERROR: staged build version '${TMP_VER:-none}' != source '$SRC_VER'; $BIN untouched." >&2
+  exit 1
+fi
+if ! $PRIV python3 "$TMP" --self-test > /dev/null 2>&1; then
+  echo "ERROR: staged build failed --self-test; $BIN untouched." >&2
+  exit 1
+fi
+HAD_FILE=0
+BACKUP_USED=""
+if [ -e "$BIN" ]; then
+  HAD_FILE=1
+  $PRIV cp -p "$BIN" "$BACKUP"
+  $PRIV chmod 0600 "$BACKUP"
+  BACKUP_USED="$BACKUP"
+fi
+# Same filesystem: rename(2) via mv is atomic, so there is no truncated-binary window.
+$PRIV chmod 0755 "$TMP"
+$PRIV mv -f "$TMP" "$BIN"
 if [ "$SELINUX" = "yes" ] && command -v restorecon > /dev/null 2>&1; then $PRIV restorecon -v "$BIN" 2> /dev/null || true; fi
-DEP_VER="$("$BIN" --version 2> /dev/null | sed 's/.* //')"
+DEP_VER="$("$BIN" --version 2> /dev/null | sed 's/.* //' || true)"
 VERIFY="pass"
 if [ "$DEP_VER" != "$SRC_VER" ]; then VERIFY="fail-version"; fi
 if [ "$VERIFY" = "pass" ] && ! "$BIN" --self-test > /dev/null 2>&1; then VERIFY="fail-self-test"; fi
@@ -288,18 +360,34 @@ if [ "$VERIFY" != "pass" ]; then
   if [ "$HAD_FILE" -eq 1 ]; then
     $PRIV cp -p "$BACKUP" "$BIN"
     $PRIV chmod 0755 "$BIN"
-  else $PRIV rm -f "$BIN"; fi
+  else
+    $PRIV rm -f "$BIN"
+  fi
   exit 1
 fi
 # Audit fix: N1 - build the manifest with json.dump and argv, never sh -c interpolation.
 $PRIV mkdir -p "$(dirname "$MANIFEST")"
-$PRIV python3 - "$MANIFEST" "$SRC_VER" "$DEP_VER" "$TS" "$BACKUP" "$PKGS" "$PREFIX" "$VERIFY" << 'PYEOF'
+BIN_SHA="$(file_sha256 "$BIN")"
+$PRIV python3 - "$MANIFEST" "$SRC_VER" "$DEP_VER" "$TS" "$BACKUP_USED" "$PKGS" "$PREFIX" "$VERIFY" "$BIN_SHA" "$BIN" << 'PYEOF'
 import json
 import sys
-dest, src_ver, dep_ver, ts, backup, pkgs, prefix, verify = sys.argv[1:9]
+
+(dest, src_ver, inst_ver, ts, backup, pkgs, prefix,
+ verify, binary_sha256, bin_path) = sys.argv[1:11]
+doc = {
+    "schema_version": 1,
+    "source_version": src_ver,
+    "installed_version": inst_ver,
+    "ts": ts,
+    "backup": backup,
+    "packages": pkgs,
+    "prefix": prefix,
+    "verify": verify,
+    "binary_sha256": binary_sha256,
+    "files": [bin_path],
+}
 with open(dest, "w", encoding="utf-8") as fh:
-    json.dump({"source_version": src_ver, "installed_version": dep_ver, "ts": ts,
-               "backup": backup, "packages": pkgs, "prefix": prefix, "verify": verify}, fh)
+    json.dump(doc, fh, indent=2, sort_keys=True)
     fh.write("\n")
 PYEOF
 echo "OK: installed $BIN $DEP_VER (verify $VERIFY)."

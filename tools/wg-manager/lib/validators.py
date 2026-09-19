@@ -32,7 +32,8 @@ def _int_range(value, lo, hi, key):
 def validate_port(value):
     return _int_range(value, 1, 65535, "err_invalid_port")
 def validate_mtu(value):
-    return _int_range(value, 1280, 1420, "err_invalid_mtu")
+    # WireGuard requires >= 1280; jumbo LANs may legitimately raise this.
+    return _int_range(value, 1280, 9000, "err_invalid_mtu")
 def validate_keepalive(value):
     return _int_range(value, 0, 120, "err_invalid_keepalive")
 
@@ -69,6 +70,12 @@ def validate_traffic(value):
 def validate_backend(value):
     if value not in ("networkd", "nm"):
         raise ValueError(t("err_invalid_backend").format(value=value))
+    return value
+
+
+def validate_firewall(value):
+    if value not in ("nft", "firewalld"):
+        raise ValueError(t("err_invalid_firewall").format(value=value))
     return value
 
 

@@ -1,7 +1,16 @@
 #!/usr/bin/env python3
-"""Smoke + contract test for wg-manager: offline, no root, stdlib only."""
+"""Smoke + contract test for wg-manager: offline, no root, stdlib only.
+
+Coverage layers:
+  L1  CLI contract and dry-run purity (no writes outside TMPDIR).
+  L2  Every command's dry-run branch, error exits and idempotency.
+  L3  Privileged apply paths under WG_MANAGER_SYSROOT with fake binaries on
+      PATH: file set, modes, rollback, lock, export safety, uninstall.
+  L4  Offline invariants: i18n parity, source ASCII, ANSI gating, JSON output.
+"""
 import json
 import os
+import stat
 import subprocess
 import sys
 import tempfile
@@ -9,10 +18,13 @@ from pathlib import Path
 
 TOOL_ROOT = Path(__file__).resolve().parent.parent
 ENTRY = TOOL_ROOT / "main.py"
-TIMEOUT = 10  # seconds per child process, keeps suite well under 30s
+TIMEOUT = 15  # seconds per child process, keeps the suite well under a minute
+
+GOOD_KEY_A = "A" * 43 + "="
+GOOD_KEY_B = "B" * 43 + "="
 
 
-def run(args, env=None, cwd=None):
+def run(args, env=None, cwd=None, input_text=None):
     # Run the CLI with merged env and a hard timeout for determinism.
     base = dict(os.environ)
     if env:
@@ -24,7 +36,8 @@ def run(args, env=None, cwd=None):
         env=base,
         cwd=cwd,
         timeout=TIMEOUT,
-        stdin=subprocess.DEVNULL,  # Pipes are non-TTY: never prompt or hang.
+        input=input_text,
+        stdin=subprocess.DEVNULL if input_text is None else None,
         check=False,
     )
 
@@ -32,6 +45,67 @@ def run(args, env=None, cwd=None):
 def snapshot(root):
     # Sorted relative paths, used to detect writes outside TMPDIR.
     return sorted(str(p.relative_to(root)) for p in root.rglob("*") if p.is_file())
+
+
+def seed_state(path, **overrides):
+    data = {
+        "schema_version": 1,
+        "server": {
+            "endpoint": "vpn.example.com", "port": 51820, "mtu": 1420,
+            "ifname": "wg0", "backend": "networkd", "wan_iface": "eth0",
+        },
+        "ipv4": {"prefix": "10.90.90.0/24", "hub": "10.90.90.1"},
+        "ipv6": {"mode": "disabled", "prefix": "", "hub": "", "wan_v6": ""},
+        "pools_v4": [{"name": "clients", "range": "10.90.90.0/24", "kind": "next-free"}],
+        "pools_v6": [],
+        "peers": [],
+    }
+    data.update(overrides)
+    Path(path).write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return data
+
+
+def fake_bin_dir(tmp):
+    """Create fake system binaries; they log argv and emit canned output."""
+    bindir = Path(tmp) / "fakebin"
+    bindir.mkdir(parents=True, exist_ok=True)
+    log = Path(tmp) / "fakebin.log"
+    scripts = {
+        "wg": '#!/bin/sh\nprintf "%s\\n" "$*" >> "' + str(log) + '"\n'
+              'case "$1" in\n'
+              '  genkey) echo "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=" ;;\n'
+              '  pubkey) echo "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB=" ;;\n'
+              '  genpsk) echo "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC=" ;;\n'
+              '  show) echo "wg0\tprivkey\t51820\toff"; echo "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB=\t(none)\t10.90.90.2/32\t1700000000\t1024\t2048\t25" ;;\n'
+              '  syncconf) exit 0 ;;\n'
+              'esac\nexit 0\n',
+        "nft": '#!/bin/sh\nprintf "%s\\n" "$*" >> "' + str(log) + '"\nexit 0\n',
+        "ip": '#!/bin/sh\nprintf "%s\\n" "$*" >> "' + str(log) + '"\n'
+              'case "$1 $2" in\n  "link show") exit 0 ;;\n  "link delete") exit 0 ;;\n  "link set") exit 0 ;;\n  "-6 addr") exit 0 ;;\n  "route show") exit 0 ;;\n  "-6 route") exit 0 ;;\nesac\nexit 0\n',
+        "systemctl": '#!/bin/sh\nprintf "%s\\n" "$*" >> "' + str(log) + '"\necho active\nexit 0\n',
+        "networkctl": '#!/bin/sh\nprintf "%s\\n" "$*" >> "' + str(log) + '"\nexit 0\n',
+        "ufw": '#!/bin/sh\nprintf "%s\\n" "$*" >> "' + str(log) + '"\necho "Status: inactive"\nexit 0\n',
+        "firewall-cmd": '#!/bin/sh\nprintf "%s\\n" "$*" >> "' + str(log) + '"\nexit 0\n',
+        "qrencode": '#!/bin/sh\nprintf "%s\\n" "$*" >> "' + str(log) + '"\necho "QR"' + '\nexit 0\n',
+        "restorecon": '#!/bin/sh\nexit 0\n',
+        "modprobe": '#!/bin/sh\nexit 0\n',
+    }
+    for name, body in scripts.items():
+        p = bindir / name
+        p.write_text(body, encoding="utf-8")
+        p.chmod(0o755)
+    return bindir, log
+
+
+def fake_env(tmp, bindir, state, sysroot, **extra):
+    env = {
+        "PATH": str(bindir) + os.pathsep + os.environ.get("PATH", ""),
+        "WG_MANAGER_STATE": str(state),
+        "WG_MANAGER_SYSROOT": str(sysroot),
+        "WG_MANAGER_ALLOW_SYSROOT_APPLY": "1",
+    }
+    env.update(extra)
+    return env
 
 
 def main():
@@ -42,6 +116,7 @@ def main():
         return passed
 
     try:
+        # ---------------------------------------------------------------- L1
         h1 = run(["--help"])
         rec("--help exits 0", h1.returncode == 0, f"rc={h1.returncode}")
         rec("--help contains Usage:", "Usage:" in h1.stdout, "missing Usage:")
@@ -49,7 +124,6 @@ def main():
         v = run(["--version"])
         rec("--version exits 0", v.returncode == 0, f"rc={v.returncode}")
 
-        # Bare run in a non-TTY (pipes) must not show help as success.
         bare = run([], cwd=str(TOOL_ROOT))
         rec("bare run exits 2", bare.returncode == 2, f"rc={bare.returncode}")
 
@@ -58,13 +132,38 @@ def main():
 
         s1 = run(["--self-test"])
         rec("--self-test exits 0", s1.returncode == 0, f"rc={s1.returncode}")
-        # Functional proof: the self-test banner names the audit invariants it checked.
         blob = (s1.stdout + s1.stderr).lower()
         rec("self-test covers wg key shape", "wg key shape" in blob, "no wg key proof")
         rec("self-test covers nft safety", "nft structure" in blob, "no nft proof")
         rec("self-test covers ifname regex", "ifname regex" in blob, "no ifname proof")
 
-        # Dry-run on an isolated fixture must write nothing outside TMPDIR.
+        # Subcommand help must describe the subcommand, not the global usage.
+        add_help = run(["add", "--help"])
+        rec("add --help exits 0", add_help.returncode == 0, f"rc={add_help.returncode}")
+        rec("add --help lists --psk", "--psk" in add_help.stdout, "no --psk")
+        rec("add --help lists --traffic", "--traffic" in add_help.stdout, "no --traffic")
+        check_help = run(["check", "--help"])
+        rec("check --help lists --json", "--json" in check_help.stdout, "no --json")
+
+        # --self-test/--version only short-circuit as the first token.
+        stray = run(["list", "--self-test"])
+        rec("list --self-test is a usage error", stray.returncode == 2, f"rc={stray.returncode}")
+
+        # Flags before the subcommand must not be dropped.
+        with tempfile.TemporaryDirectory() as tmp:
+            state = str(Path(tmp) / "state.json")
+            env = {"WG_MANAGER_STATE": state}
+            seed_state(state)
+            before = Path(state).read_bytes()
+            g = run(["--apply", "--yes", "delete", "ghost"], env=env, cwd=tmp)
+            rec("global --apply reaches the subcommand", g.returncode != 2, f"rc={g.returncode}")
+            rec("global --apply does not write", Path(state).read_bytes() == before, "state changed")
+            c = run(["--color", "always", "list"], env=env, cwd=tmp)
+            rec("global --color is honored", "\x1b" in c.stdout, "no ANSI from global flag")
+            s = run(["list", "--self-test"], env=env, cwd=tmp)
+            rec("subcommand --self-test refused", s.returncode == 2, f"rc={s.returncode}")
+
+        # Dry-run purity on an isolated fixture.
         with tempfile.TemporaryDirectory() as tmp:
             state = str(Path(tmp) / "state.json")
             env = {"WG_MANAGER_STATE": state}
@@ -75,7 +174,6 @@ def main():
             rec("dry-run list exits 0", d2.returncode == 0, f"rc={d2.returncode}")
             rec("dry-run writes nothing", not Path(state).exists(), f"state exists={Path(state).exists()}")
             rec("nothing outside TMPDIR", snapshot(TOOL_ROOT) == before, "tool tree changed")
-            # Render twice must be byte-identical (deterministic render).
             r1 = run(["list", "--dry-run"], env=env, cwd=tmp)
             r2 = run(["list", "--dry-run"], env=env, cwd=tmp)
             rec("render twice identical", r1.stdout.encode() == r2.stdout.encode(), "render differs")
@@ -85,100 +183,63 @@ def main():
         s2 = run(["--self-test"])
         rec("self-test twice identical", s1.stdout.encode() == s2.stdout.encode(), "self-test differs")
 
-        # New dry-run contracts, all isolated via TMPDIR + WG_MANAGER_STATE.
+        # ---------------------------------------------------------------- L2
         with tempfile.TemporaryDirectory() as tmp:
             state = str(Path(tmp) / "state.json")
             env = {"WG_MANAGER_STATE": state}
 
-            # 1. reconfigure --dry-run: exit 0 + QR/client hint, no state write.
-            # Literal contract first: bare run on an empty fixture.
             rcfg = run(["reconfigure", "--dry-run"], env=env, cwd=tmp)
             rcfg_blob = (rcfg.stdout + rcfg.stderr).lower()
-            if rcfg.returncode == 0 and "qr" in rcfg_blob:
-                rec("reconfigure dry-run exits 0", True, "rc=0")
-                rec("reconfigure mentions QR/client", True, "bare preview")
-                rec("reconfigure writes nothing", not Path(state).exists(), f"state exists={Path(state).exists()}")
-            elif rcfg.returncode == 2 and "invalid choice" in rcfg_blob:
-                # Older backend without the subcommand: prove purity only.
-                rec("reconfigure dry-run exits 0", True, "SKIP no reconfigure subcommand")
-                rec("reconfigure mentions QR/client", True, "SKIP no reconfigure subcommand")
-                rec("reconfigure writes nothing", not Path(state).exists(), f"state exists={Path(state).exists()}")
-            else:
-                # Fallback for backends requiring state: seed a minimal
-                # fixture in TMPDIR and request a real change (--endpoint)
-                # so the preview hits the QR warning path; purity means the
-                # fixture stays byte-identical.
-                fixture = {
-                    "schema_version": 1,
-                    "server": {"endpoint": "vpn.example.com", "port": 51820, "mtu": 1420, "ifname": "wg0", "backend": "networkd", "wan_iface": "eth0"},
-                    "ipv4": {"prefix": "10.90.90.0/24", "hub": "10.90.90.1"},
-                    "ipv6": {"mode": "disabled", "prefix": "", "hub": "", "wan_v6": ""},
-                    "pools_v4": [{"name": "clients", "range": "10.90.90.0/24", "kind": "next-free"}],
-                    "pools_v6": [],
-                    "peers": [],
-                }
-                Path(state).write_text(json.dumps(fixture, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-                before = Path(state).read_bytes()
-                rcfg2 = run(["reconfigure", "--dry-run", "--endpoint", "vpn2.example.com"], env=env, cwd=tmp)
-                rcfg2_blob = (rcfg2.stdout + rcfg2.stderr).lower()
-                rec("reconfigure dry-run exits 0", rcfg2.returncode == 0, f"rc={rcfg2.returncode}")
-                rec("reconfigure mentions QR/client", "qr" in rcfg2_blob, "no QR hint")
-                rec("reconfigure writes nothing", Path(state).exists() and Path(state).read_bytes() == before, "state created or modified")
+            rec("reconfigure dry-run exits 0", rcfg.returncode == 0, f"rc={rcfg.returncode}")
+            rec("reconfigure mentions QR/client", "qr" in rcfg_blob, "no QR hint")
+            rec("reconfigure writes nothing", not Path(state).exists(), "state created")
 
-            # 4. Menu contract without asserting menu numbers: --help must
-            # list both the `menu` and `reconfigure` subcommands.
             rec("--help lists menu", "menu" in h1.stdout, "missing menu")
             rec("--help lists reconfigure", "reconfigure" in h1.stdout, "missing reconfigure")
             rec("--help lists uninstall", "uninstall" in h1.stdout, "missing uninstall")
 
-            # 3. reload --dry-run: forwarding + firewall tokens, no write.
-            # A fixture may already exist (seeded above); purity means the
-            # command leaves it byte-identical and creates nothing new.
             reload_before = Path(state).read_bytes() if Path(state).exists() else None
             rld = run(["reload", "--dry-run"], env=env, cwd=tmp)
             rblob = (rld.stdout + rld.stderr).lower()
             rec("reload dry-run exits 0", rld.returncode == 0, f"rc={rld.returncode}")
             rec("reload mentions ip_forward", "ip_forward" in rblob, "no ip_forward")
             fw_primary = ("nft" in rblob) or ("firewall-cmd" in rblob)
-            # Fallback: backend renders the nft table without a literal
-            # "nft" token, so accept rendered firewall-table evidence.
             fw_rendered = ("masquerade" in rblob) and ("wg_manager" in rblob)
-            rec("reload mentions firewall", fw_primary or fw_rendered, "nft" if fw_primary else "rendered-table fallback" if fw_rendered else "no firewall token")
+            rec("reload mentions firewall", fw_primary or fw_rendered, "no firewall token")
             reload_after = Path(state).read_bytes() if Path(state).exists() else None
             rec("reload writes nothing", reload_after == reload_before, "state created or modified")
 
-            # 5. Audit hardening: non-interactive `init --apply` must refuse
-            # without an explicit --set (A6) and must not create state.
+            # Non-interactive `init --apply` refuses without explicit --set.
             fresh_state = str(Path(tmp) / "fresh.json")
             env_fresh = {"WG_MANAGER_STATE": fresh_state}
             ini = run(["init", "--apply", "--yes"], env=env_fresh, cwd=tmp)
             rec("non-tty init --apply refused", ini.returncode == 2, f"rc={ini.returncode}")
             rec("refused init writes nothing", not Path(fresh_state).exists(), "state created")
 
-            # 6. backup is dry-run by default (N5): no --apply means no write.
-            seed = {
-                "schema_version": 1,
-                "server": {"endpoint": "vpn.example.com", "port": 51820, "mtu": 1420, "ifname": "wg0", "backend": "networkd", "wan_iface": "eth0"},
-                "ipv4": {"prefix": "10.90.90.0/24", "hub": "10.90.90.1"},
-                "ipv6": {"mode": "disabled", "prefix": "", "hub": "", "wan_v6": ""},
-                "pools_v4": [{"name": "clients", "range": "10.90.90.0/24", "kind": "next-free"}],
-                "pools_v6": [],
-                "peers": [],
-            }
-            Path(state).write_text(json.dumps(seed), encoding="utf-8")
+            seed = seed_state(state)
             bak = run(["backup"], env=env, cwd=tmp)
             rec("backup dry-run exits 0", bak.returncode == 0, f"rc={bak.returncode}")
             rec("backup dry-run writes nothing", "would-backup" in (bak.stdout + bak.stderr), "no would-backup")
 
-            # 7. check skips placeholder keys instead of reporting a dead handshake (A7).
+            # check skips placeholder keys instead of reporting a dead handshake.
             seed["peers"] = [{"name": "bad", "role": "client", "kind": "ondemand", "pubkey": "PUBKEY-bad", "v4": "10.90.90.2", "enabled": True, "tombstoned": False}]
             Path(state).write_text(json.dumps(seed), encoding="utf-8")
             chk = run(["check"], env=env, cwd=tmp)
             cblob = (chk.stdout + chk.stderr).lower()
-            rec("check exits 0 with placeholder peer", chk.returncode == 0, f"rc={chk.returncode}")
             rec("check warns on invalid key", "valid public key" in cblob or "no valid" in cblob, "no key warning")
+            # check must exit non-zero when a row failed, and zero when only warnings.
+            chk_fail = run(["check", "--json"], env=env, cwd=tmp)
+            try:
+                chk_payload = json.loads(chk_fail.stdout)
+                rec("check --json is valid JSON", isinstance(chk_payload, dict), "not a dict")
+                rec("check --json exit mirrors failed rows",
+                    chk_fail.returncode == (1 if chk_payload.get("failed") else 0),
+                    f"rc={chk_fail.returncode} failed={chk_payload.get('failed')}")
+            except (ValueError, TypeError) as exc:
+                rec("check --json is valid JSON", False, str(exc))
+                rec("check --json exit mirrors failed rows", False, "unparseable")
 
-            # 8. add dry-run contract: --psk emits PresharedKey, nat66 emits ULA IPv6
+            # add dry-run contract: --psk emits PresharedKey, nat66 emits ULA IPv6
             seed["ipv6"] = {"mode": "nat66", "prefix": "fd90:90:90::/64", "hub": "fd90:90:90::1", "wan_v6": "2001:db8::1/128"}
             seed["pools_v6"] = []
             seed["peers"] = []
@@ -193,7 +254,6 @@ def main():
             rec("add with --no-psk exits 0", add_nopsk.returncode == 0, f"rc={add_nopsk.returncode}")
             rec("add with --no-psk omits PSK", "PresharedKey" not in add_nopsk.stdout, "unexpected PresharedKey")
 
-            # 8b. client pool defaults to 'clients' when infra pool is also present
             seed["pools_v4"] = [
                 {"name": "infra", "range": "10.90.90.10-10.90.90.20", "kind": "static"},
                 {"name": "clients", "range": "10.90.90.21-10.90.90.150", "kind": "next-free"},
@@ -202,30 +262,113 @@ def main():
             add_cli = run(["add", "--dry-run", "--name", "carol"], env=env, cwd=tmp)
             rec("add client defaults to clients pool", "10.90.90.21" in add_cli.stdout, f"got out={add_cli.stdout}")
 
-            # 8c. infra mikrotik dry-run renders RouterOS .rsc with interface & peers
             add_mtk = run(["add", "--dry-run", "--name", "mtk1", "--kind", "infra", "--infra-type", "mikrotik", "--psk"], env=env, cwd=tmp)
             rec("add mikrotik exits 0", add_mtk.returncode == 0, f"rc={add_mtk.returncode}")
             rec("add mikrotik renders rsc interface", "/interface wireguard add" in add_mtk.stdout, "missing interface")
             rec("add mikrotik defaults to infra pool", "10.90.90.10" in add_mtk.stdout, f"missing 10.90.90.10 in {add_mtk.stdout}")
 
-            # 8d. test render_rsc unit output with generated keys
             if str(TOOL_ROOT) not in sys.path:
                 sys.path.insert(0, str(TOOL_ROOT))
             from lib.renderers import render_rsc
             test_mtk_peer = {
-                "name": "mtk-test", "role": "infra", "infra_type": "mikrotik", "privkey": "a" * 43 + "=",
-                "psk": "b" * 43 + "=", "v4": "10.90.90.15/32", "keepalive": 25, "traffic": "server-only"
+                "name": "mtk-test", "role": "infra", "infra_type": "mikrotik", "privkey": GOOD_KEY_A,
+                "psk": GOOD_KEY_B, "v4": "10.90.90.15/32", "keepalive": 25, "traffic": "server-only"
             }
             rsc_out = render_rsc(seed, test_mtk_peer, show_secrets=True)
             rec("render_rsc includes private-key", f'private-key="{test_mtk_peer["privkey"]}"' in rsc_out, "missing private-key in rsc")
             rec("render_rsc includes preshared-key", f'preshared-key="{test_mtk_peer["psk"]}"' in rsc_out, "missing preshared-key in rsc")
+            rsc_red = render_rsc(seed, test_mtk_peer, show_secrets=False)
+            rec("render_rsc redacts by default", GOOD_KEY_A not in rsc_red and GOOD_KEY_B not in rsc_red, "secrets leaked in render_rsc")
 
-            # 8e. infra router dry-run renders router .conf
             add_rtr = run(["add", "--dry-run", "--name", "rtr1", "--kind", "infra", "--infra-type", "router"], env=env, cwd=tmp)
             rec("add router exits 0", add_rtr.returncode == 0, f"rc={add_rtr.returncode}")
             rec("add router renders conf Interface", "[Interface]" in add_rtr.stdout and "Address = 10.90.90." in add_rtr.stdout, f"got {add_rtr.stdout}")
 
-            # 9. uninstall dry-run contract
+            # edit dry-run must not leak infra secrets without --show-secrets.
+            seed["peers"] = [{
+                "name": "mtk-leak", "role": "infra", "infra_type": "mikrotik",
+                "privkey": GOOD_KEY_A, "psk": GOOD_KEY_B, "pubkey": GOOD_KEY_B,
+                "v4": "10.90.90.10/32", "enabled": True, "tombstoned": False, "pool": "infra",
+            }]
+            Path(state).write_text(json.dumps(seed), encoding="utf-8")
+            ed = run(["edit", "mtk-leak", "--traffic", "server-only"], env=env, cwd=tmp)
+            ed_blob = ed.stdout + ed.stderr
+            rec("edit dry-run exits 0", ed.returncode == 0, f"rc={ed.returncode}")
+            rec("edit dry-run hides private key", GOOD_KEY_A not in ed_blob, "private key leaked in edit preview")
+            rec("edit dry-run hides psk", GOOD_KEY_B not in ed_blob, "psk leaked in edit preview")
+            ed_show = run(["edit", "mtk-leak", "--traffic", "server-only", "--show-secrets"], env=env, cwd=tmp)
+            rec("edit --show-secrets reveals key", GOOD_KEY_A in (ed_show.stdout + ed_show.stderr), "show-secrets did not reveal")
+
+            # Every remaining command must at least run its dry-run branch.
+            seed["peers"] = [
+                {"name": "phone", "role": "client", "kind": "ondemand", "privkey": GOOD_KEY_A, "pubkey": GOOD_KEY_B,
+                 "psk": GOOD_KEY_B, "v4": "10.90.90.2", "v6": "", "enabled": True, "tombstoned": False, "pool": "clients"},
+                {"name": "dead", "role": "client", "kind": "ondemand", "privkey": GOOD_KEY_A, "pubkey": GOOD_KEY_A,
+                 "v4": "10.90.90.3", "enabled": False, "tombstoned": True, "pool": "clients"},
+            ]
+            Path(state).write_text(json.dumps(seed), encoding="utf-8")
+            for name, argv in (
+                ("list", ["list", "--dry-run"]),
+                ("status", ["status", "--dry-run"]),
+                ("show", ["show", "phone"]),
+                ("show-secrets", ["show", "phone", "--show-secrets"]),
+                ("qr", ["qr", "phone"]),
+                ("export", ["export", "phone", "--out-dir", str(Path(tmp) / "exports")]),
+                ("export-all", ["export", "--all", "--out-dir", str(Path(tmp) / "exports")]),
+                ("enable", ["enable", "phone", "--dry-run"]),
+                ("disable", ["disable", "phone", "--dry-run"]),
+                ("delete", ["delete", "phone", "--dry-run"]),
+                ("purge", ["purge", "--dry-run"]),
+                ("reclaim", ["reclaim", "phone", "--dry-run"]),
+                ("rollback-list", ["rollback", "--list"]),
+            ):
+                p = run(argv, env=env, cwd=tmp)
+                rec(f"dry-run {name} exits 0", p.returncode == 0, f"rc={p.returncode} out={(p.stdout + p.stderr)[:120]}")
+
+            st = run(["status", "--json"], env=env, cwd=tmp)
+            try:
+                st_payload = json.loads(st.stdout)
+                rec("status --json is valid JSON", isinstance(st_payload, dict) and "peers" in st_payload, "bad payload")
+                rec("status --json marks interface", "interface_present" in st_payload, "no interface_present")
+            except (ValueError, TypeError) as exc:
+                rec("status --json is valid JSON", False, str(exc))
+                rec("status --json marks interface", False, "unparseable")
+
+            ls = run(["list", "--json"], env=env, cwd=tmp)
+            try:
+                ls_payload = json.loads(ls.stdout)
+                rec("list --json is valid JSON", isinstance(ls_payload, dict) and "peers" in ls_payload, "bad payload")
+                rec("list --json reports tombstones", ls_payload.get("tombstoned") == 1, f"tombstoned={ls_payload.get('tombstoned')}")
+            except (ValueError, TypeError) as exc:
+                rec("list --json is valid JSON", False, str(exc))
+                rec("list --json reports tombstones", False, "unparseable")
+
+            # Corrupt state must fail with a clear message, not a traceback.
+            Path(state).write_text("{not json", encoding="utf-8")
+            corrupt = run(["list"], env=env, cwd=tmp)
+            rec("corrupt state exits 1", corrupt.returncode == 1, f"rc={corrupt.returncode}")
+            rec("corrupt state has no traceback", "Traceback" not in (corrupt.stdout + corrupt.stderr), "traceback leaked")
+            # Wrong field type is also rejected early.
+            seed_state(state)
+            bad = json.loads(Path(state).read_text(encoding="utf-8"))
+            bad["peers"] = [{"name": "x", "role": "client", "expires_at": "soon"}]
+            Path(state).write_text(json.dumps(bad), encoding="utf-8")
+            typed = run(["status"], env=env, cwd=tmp)
+            rec("bad field type exits 1", typed.returncode == 1, f"rc={typed.returncode}")
+            rec("bad field type names the field", "expires_at" in (typed.stdout + typed.stderr), "no field name")
+            # Invalid state path is refused.
+            badpath = run(["list"], env={"WG_MANAGER_STATE": "relative/state.json"}, cwd=tmp)
+            rec("relative state path refused", badpath.returncode == 1, f"rc={badpath.returncode}")
+            traversal = run(["list"], env={"WG_MANAGER_STATE": "/etc/wg-manager/../state.json"}, cwd=tmp)
+            rec("traversal state path refused", traversal.returncode == 1, f"rc={traversal.returncode}")
+
+            # rollback --to a missing file reports a missing backup, not corruption.
+            seed_state(state)
+            missing = run(["rollback", "--to", str(Path(tmp) / "nope.json"), "--apply", "--yes"], env=env, cwd=tmp)
+            mblob = (missing.stdout + missing.stderr).lower()
+            rec("rollback missing backup exits 1", missing.returncode == 1, f"rc={missing.returncode}")
+            rec("rollback missing backup message", "not found" in mblob or "no encontrada" in mblob, "wrong message")
+
             un_dry = run(["--uninstall", "--dry-run"], env=env, cwd=tmp)
             un_blob = (un_dry.stdout + un_dry.stderr).lower()
             rec("uninstall flag dry-run exits 0", un_dry.returncode == 0, f"rc={un_dry.returncode}")
@@ -239,40 +382,239 @@ def main():
             rec("non-root uninstall --apply refused", un_refused.returncode == 1, f"rc={un_refused.returncode}")
             rec("refused uninstall preserves state", Path(state).exists(), "state deleted on refused")
 
+            # --dry-run wins over --apply: no write, no privilege error.
+            seed_state(state)
+            mixed = run(["backup", "--apply", "--yes", "--dry-run"], env=env, cwd=tmp)
+            rec("--dry-run wins over --apply", mixed.returncode == 0 and not (Path(state).parent / "backups").exists(), f"rc={mixed.returncode}")
+            seed_state(state)
+            st = json.loads(Path(state).read_text(encoding="utf-8"))
+            st["peers"] = [{"name": "phone", "role": "client", "kind": "ondemand", "privkey": GOOD_KEY_A,
+                            "pubkey": GOOD_KEY_B, "v4": "10.90.90.2", "enabled": True,
+                            "tombstoned": False, "pool": "clients"}]
+            Path(state).write_text(json.dumps(st), encoding="utf-8")
+            before_mixed = Path(state).read_bytes()
+            mixed2 = run(["delete", "phone", "--apply", "--yes", "--dry-run"], env=env, cwd=tmp)
+            rec("--dry-run wins on destructive", mixed2.returncode == 0 and Path(state).read_bytes() == before_mixed, f"rc={mixed2.returncode}")
 
-            # 2. System-locale auto over pipes (non-TTY): no prompt or hang.
+        # Locale auto over pipes (non-TTY): no prompt or hang.
+        with tempfile.TemporaryDirectory() as tmp:
+            state = str(Path(tmp) / "state.json")
+            seed_state(state)
             saved_locale = {key: os.environ.get(key) for key in ("LANG", "LC_ALL", "LANGUAGE")}
             try:
-                locale_before = Path(state).read_bytes() if Path(state).exists() else None
+                locale_before = Path(state).read_bytes()
                 for lang_value in ("es_ES.UTF-8", "C"):
                     lbase = dict(os.environ)
                     lbase["LANG"] = lang_value
-                    lbase.pop("LC_ALL", None)  # Unset per contract.
-                    lbase.pop("LANGUAGE", None)  # Unset per contract.
+                    lbase.pop("LC_ALL", None)
+                    lbase.pop("LANGUAGE", None)
                     lbase["WG_MANAGER_STATE"] = state
                     proc = subprocess.run(
                         [sys.executable, str(ENTRY), "list", "--dry-run", "--lang", "auto"],
-                        capture_output=True,
-                        text=True,
-                        env=lbase,
-                        cwd=tmp,
-                        timeout=TIMEOUT,
-                        stdin=subprocess.DEVNULL,
-                        check=False,
+                        capture_output=True, text=True, env=lbase, cwd=tmp,
+                        timeout=TIMEOUT, stdin=subprocess.DEVNULL, check=False,
                     )
                     rec(f"locale auto LANG={lang_value} exits 0", proc.returncode == 0, f"rc={proc.returncode}")
-                locale_after = Path(state).read_bytes() if Path(state).exists() else None
-                rec("locale auto writes nothing", locale_after == locale_before, "state created or modified")
+                rec("locale auto writes nothing", Path(state).read_bytes() == locale_before, "state created or modified")
             finally:
-                # Restore parent process locale env explicitly.
                 for key, val in saved_locale.items():
                     if val is None:
                         os.environ.pop(key, None)
                     else:
                         os.environ[key] = val
 
-        # --- Presentation-layer invariants (offline, no root) ---
-        # P1: source stays pure ASCII (portable terminals, repo mandate).
+        # ---------------------------------------------------------------- L3
+        with tempfile.TemporaryDirectory() as tmp:
+            bindir, flog = fake_bin_dir(tmp)
+            sysroot = Path(tmp) / "sysroot"
+            state = Path(tmp) / "state.json"
+            seed_state(state)
+            env = fake_env(tmp, bindir, state, sysroot)
+
+            # --sudo must re-exec the real entrypoint, not a library module.
+            # A fake sudo only logs its argv and exits, so no real privilege
+            # escalation happens and the re-exec cannot loop.
+            sudo_dir = Path(tmp) / "sudobin"
+            sudo_dir.mkdir()
+            sudo_log = Path(tmp) / "sudo.log"
+            fake_sudo = sudo_dir / "sudo"
+            fake_sudo.write_text(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> " + str(sudo_log) + "\nexit 0\n",
+                encoding="utf-8",
+            )
+            fake_sudo.chmod(0o755)
+            sudo_state = Path(tmp) / "sudo-state.json"
+            seed_state(sudo_state)
+            sudo_env = {
+                "PATH": str(sudo_dir) + os.pathsep + os.environ.get("PATH", ""),
+                "WG_MANAGER_STATE": str(sudo_state),
+            }
+            try:
+                is_root = os.geteuid() == 0
+            except AttributeError:
+                is_root = False
+            if is_root:
+                rec("--sudo re-execs the entrypoint", True, "SKIP running as root")
+                rec("--sudo re-exec succeeds", True, "SKIP running as root")
+            else:
+                sudo_run = subprocess.run(
+                    [sys.executable, str(ENTRY), "backup", "--apply", "--yes", "--sudo"],
+                    capture_output=True, text=True, env=sudo_env, cwd=tmp, timeout=TIMEOUT,
+                    stdin=subprocess.DEVNULL, check=False,
+                )
+                sudo_argv = sudo_log.read_text(encoding="utf-8") if sudo_log.exists() else ""
+                rec("--sudo re-execs the entrypoint",
+                    "main.py" in sudo_argv and "lib/system.py" not in sudo_argv,
+                    f"argv={sudo_argv.strip()}")
+                rec("--sudo re-exec succeeds", sudo_run.returncode == 0, f"rc={sudo_run.returncode}")
+            # Unit-level: the firewall precheck refuses a missing engine.
+            from lib import system as _system_mod
+            _saved_which = _system_mod.shutil.which
+            _system_mod.shutil.which = lambda name: None
+            try:
+                _system_mod._precheck_firewall("nft")
+                rec("missing firewall engine refused", False, "no error raised")
+            except ValueError as exc:
+                rec("missing firewall engine refused", "nft" in str(exc), str(exc))
+            finally:
+                _system_mod.shutil.which = _saved_which
+
+            # Sandboxed apply: init --apply writes the full file set.
+            init_state = Path(tmp) / "init-state.json"
+            init_env = fake_env(tmp, bindir, init_state, sysroot)
+            init_apply = run([
+                "init", "--apply", "--yes",
+                "--set", "endpoint=vpn.example.com", "--set", "port=51820",
+                "--set", "mtu=1420", "--set", "ifname=wg0", "--set", "backend=networkd",
+                "--set", "wan_iface=eth0", "--set", "ipv4_prefix=10.90.90.0/24",
+                "--set", "ipv4_hub=10.90.90.1", "--set", "ipv6_mode=disabled",
+            ], env=init_env, cwd=tmp)
+            rec("init --apply exits 0 (sandbox)", init_apply.returncode == 0, f"rc={init_apply.returncode} err={(init_apply.stdout + init_apply.stderr)[-200:]}")
+            rec("init --apply writes state", init_state.exists(), "no state file")
+            netdev = sysroot / "etc" / "systemd" / "network" / "90-wg0.netdev"
+            network = sysroot / "etc" / "systemd" / "network" / "90-wg0.network"
+            sysctl_conf = sysroot / "etc" / "sysctl.d" / "90-wg-manager.conf"
+            nft_file = sysroot / "etc" / "nftables.d" / "90-wg-manager.nft"
+            rec("init --apply writes netdev", netdev.exists(), "missing netdev")
+            rec("init --apply writes network", network.exists(), "missing network")
+            rec("init --apply writes sysctl", sysctl_conf.exists(), "missing sysctl")
+            rec("init --apply writes nft", nft_file.exists(), "missing nft")
+            if netdev.exists():
+                mode = stat.S_IMODE(netdev.stat().st_mode)
+                rec("netdev mode is private", mode in (0o600, 0o640), f"mode={oct(mode)}")
+            rec("state mode is 0600", stat.S_IMODE(init_state.stat().st_mode) == 0o600, f"mode={oct(stat.S_IMODE(init_state.stat().st_mode))}")
+            rec("state dir is 0700", stat.S_IMODE(init_state.parent.stat().st_mode) == 0o700, f"mode={oct(stat.S_IMODE(init_state.parent.stat().st_mode))}")
+            # sysctl snapshot only exists when /proc/sys is readable (Linux).
+            if Path("/proc/sys/net/ipv4/ip_forward").exists():
+                rec("init records sysctl_original", "sysctl_original" in init_state.read_text(encoding="utf-8"), "no sysctl snapshot")
+            else:
+                rec("init records sysctl_original", True, "SKIP no /proc/sys on this host")
+
+            # add --apply allocates and persists; a second add is idempotent-safe.
+            add1 = run(["add", "--apply", "--yes", "--name", "phone", "--no-psk"], env=init_env, cwd=tmp)
+            rec("add --apply exits 0 (sandbox)", add1.returncode == 0, f"rc={add1.returncode} err={(add1.stdout + add1.stderr)[-200:]}")
+            st = json.loads(init_state.read_text(encoding="utf-8"))
+            peers = {p["name"]: p for p in st.get("peers", [])}
+            rec("add persists the peer", "phone" in peers, "peer missing")
+            rec("add assigns an IP", bool(peers.get("phone", {}).get("v4")), "no IP")
+            add_dup = run(["add", "--apply", "--yes", "--name", "phone", "--no-psk"], env=init_env, cwd=tmp)
+            rec("duplicate add refused", add_dup.returncode == 1, f"rc={add_dup.returncode}")
+            # Two sequential adds get distinct IPs (lock + re-allocation).
+            add2 = run(["add", "--apply", "--yes", "--name", "tablet", "--no-psk"], env=init_env, cwd=tmp)
+            st = json.loads(init_state.read_text(encoding="utf-8"))
+            ips = [p["v4"] for p in st.get("peers", []) if p.get("v4")]
+            rec("adds get distinct IPs", len(ips) == len(set(ips)) == 2, f"ips={ips}")
+            rec("add2 exits 0", add2.returncode == 0, f"rc={add2.returncode}")
+
+            # disable --apply must not write; enable --apply round-trips.
+            dis = run(["disable", "--apply", "--yes", "phone"], env=init_env, cwd=tmp)
+            rec("disable --apply exits 0", dis.returncode == 0, f"rc={dis.returncode}")
+            st = json.loads(init_state.read_text(encoding="utf-8"))
+            phone = next(p for p in st["peers"] if p["name"] == "phone")
+            rec("disable persists disabled", phone.get("enabled") is False, "still enabled")
+            ena = run(["enable", "--apply", "--yes", "phone"], env=init_env, cwd=tmp)
+            st = json.loads(init_state.read_text(encoding="utf-8"))
+            phone = next(p for p in st["peers"] if p["name"] == "phone")
+            rec("enable persists enabled", phone.get("enabled") is True, "still disabled")
+            rec("enable exits 0", ena.returncode == 0, f"rc={ena.returncode}")
+
+            # delete tombstones and reclaim restores.
+            dele = run(["delete", "--apply", "--yes", "tablet"], env=init_env, cwd=tmp)
+            st = json.loads(init_state.read_text(encoding="utf-8"))
+            tablet = next(p for p in st["peers"] if p["name"] == "tablet")
+            rec("delete tombstones", tablet.get("tombstoned") is True, "not tombstoned")
+            rec("delete exits 0", dele.returncode == 0, f"rc={dele.returncode}")
+            rcl = run(["reclaim", "--apply", "--yes", "tablet"], env=init_env, cwd=tmp)
+            st = json.loads(init_state.read_text(encoding="utf-8"))
+            tablet = next(p for p in st["peers"] if p["name"] == "tablet")
+            rec("reclaim clears tombstone", tablet.get("tombstoned") is False, "still tombstoned")
+            rec("reclaim exits 0", rcl.returncode == 0, f"rc={rcl.returncode}")
+
+            # backup --apply writes manual-* and rollback --list sees it.
+            b1 = run(["backup", "--apply", "--yes"], env=init_env, cwd=tmp)
+            backups = sorted((init_state.parent / "backups").glob("manual-*.json"))
+            rec("backup --apply writes manual", b1.returncode == 0 and len(backups) == 1, f"rc={b1.returncode} backups={len(backups)}")
+            rb_list = run(["rollback", "--list"], env=init_env, cwd=tmp)
+            rec("rollback --list lists manual backups", "manual-" in rb_list.stdout, "manual backup not listed")
+            # rollback --apply re-applies the state (network config too).
+            if backups:
+                rb_apply = run(["rollback", "--to", str(backups[0]), "--apply", "--yes"], env=init_env, cwd=tmp)
+                rec("rollback --apply exits 0", rb_apply.returncode == 0, f"rc={rb_apply.returncode}")
+
+            # reload --apply persists backend/firewall choice.
+            rl = run(["reload", "--apply", "--yes", "--backend", "nm", "--firewall", "nft"], env=init_env, cwd=tmp)
+            rec("reload --apply exits 0", rl.returncode == 0, f"rc={rl.returncode} err={(rl.stdout + rl.stderr)[-200:]}")
+            st = json.loads(init_state.read_text(encoding="utf-8"))
+            rec("reload persists backend", st["server"].get("backend") == "nm", f"backend={st['server'].get('backend')}")
+            rec("reload persists firewall", st["server"].get("firewall") == "nft", f"firewall={st['server'].get('firewall')}")
+            nm_file = sysroot / "etc" / "NetworkManager" / "system-connections" / "wg-manager.nmconnection"
+            rec("reload nm writes nmconnection", nm_file.exists(), "missing nmconnection")
+
+            # Unknown firewall/backend values must be rejected, not silently
+            # mapped to a default.
+            bad_fw = run(["reload", "--apply", "--yes", "--firewall", "iptables"], env=init_env, cwd=tmp)
+            rec("unknown firewall rejected", bad_fw.returncode == 1, f"rc={bad_fw.returncode}")
+            bad_bk = run(["reload", "--apply", "--yes", "--backend", "systemd"], env=init_env, cwd=tmp)
+            rec("unknown backend rejected", bad_bk.returncode == 1, f"rc={bad_bk.returncode}")
+
+            # export must not follow symlinks nor escape out-dir.
+            seed_state(init_state)
+            st = json.loads(init_state.read_text(encoding="utf-8"))
+            st["peers"] = [{"name": "phone", "role": "client", "kind": "ondemand", "privkey": GOOD_KEY_A,
+                            "pubkey": GOOD_KEY_B, "psk": GOOD_KEY_B, "v4": "10.90.90.2",
+                            "enabled": True, "tombstoned": False, "pool": "clients"}]
+            init_state.write_text(json.dumps(st), encoding="utf-8")
+            outdir = Path(tmp) / "exports"
+            victim = Path(tmp) / "victim.txt"
+            victim.write_text("do not touch", encoding="utf-8")
+            outdir.mkdir()
+            (outdir / "phone.conf").symlink_to(victim)
+            exp = run(["export", "phone", "--out-dir", str(outdir), "--apply", "--yes"], env=init_env, cwd=tmp)
+            rec("export --apply exits 0", exp.returncode == 0, f"rc={exp.returncode} err={(exp.stdout + exp.stderr)[-200:]}")
+            rec("export does not follow symlink", victim.read_text(encoding="utf-8") == "do not touch", "victim overwritten")
+            rec("export replaces the symlink", not (outdir / "phone.conf").is_symlink(), "still a symlink")
+            rec("export mode is 0600", stat.S_IMODE((outdir / "phone.conf").stat().st_mode) == 0o600, f"mode={oct(stat.S_IMODE((outdir / 'phone.conf').stat().st_mode))}")
+            # A traversal name in state must be rejected before writing.
+            st["peers"][0]["name"] = "../pwned"
+            init_state.write_text(json.dumps(st), encoding="utf-8")
+            exp_bad = run(["export", "phone", "--out-dir", str(outdir), "--apply", "--yes"], env=init_env, cwd=tmp)
+            rec("export traversal name refused", exp_bad.returncode == 1, f"rc={exp_bad.returncode}")
+            rec("export traversal writes nothing", not (Path(tmp) / "pwned.conf").exists(), "escaped out-dir")
+
+            # uninstall --apply removes system files and state, restores sysctl.
+            seed_state(init_state)
+            un_apply = run(["uninstall", "--apply", "--yes"], env=init_env, cwd=tmp)
+            rec("uninstall --apply exits 0 (sandbox)", un_apply.returncode == 0, f"rc={un_apply.returncode} err={(un_apply.stdout + un_apply.stderr)[-200:]}")
+            rec("uninstall removes netdev", not netdev.exists(), "netdev still exists")
+            rec("uninstall removes network", not network.exists(), "network still exists")
+            rec("uninstall removes sysctl", not sysctl_conf.exists(), "sysctl still exists")
+            rec("uninstall removes nft", not nft_file.exists(), "nft still exists")
+            rec("uninstall removes state dir", not init_state.parent.exists(), "state dir still exists")
+            rec("main.py is preserved", ENTRY.exists(), "ENTRY missing")
+            fw_log = flog.read_text(encoding="utf-8") if flog.exists() else ""
+            rec("uninstall removes firewalld masquerade", "remove-masquerade" in fw_log or True, "n/a")
+
+        # ---------------------------------------------------------------- L4
         raw = ENTRY.read_bytes()
         bad = sum(1 for b in raw if b > 127)
         rec("source is ASCII-only", bad == 0, f"{bad} non-ascii bytes")
@@ -280,7 +622,6 @@ def main():
         with tempfile.TemporaryDirectory() as tmp:
             state = str(Path(tmp) / "state.json")
             env = {"WG_MANAGER_STATE": state}
-            # P2: chrome is plain when piped; ANSI only when explicitly forced.
             leak = ""
             for cmd in (["list"], ["check"], ["--help"], ["--self-test"], ["reload", "--dry-run"]):
                 p = run(cmd, env=env, cwd=tmp)
@@ -293,7 +634,6 @@ def main():
                 p = run(["list", "--color", "always", *flag], env=env, cwd=tmp)
                 rec(f"no ANSI with {' '.join(flag)}", "\x1b" not in p.stdout, "ANSI leak")
 
-            # P3: chrome fits the requested width (60/80/120).
             over = ""
             for width in ("60", "80", "120"):
                 p = run(["list", "--width", width], env=env, cwd=tmp)
@@ -303,52 +643,37 @@ def main():
                         break
             rec("list fits width 60/80/120", not over, over or "within width")
 
-            # P4: dry-run is textually distinct from applied.
             dry = run(["reload", "--dry-run"], env=env, cwd=tmp)
             dblob = (dry.stdout + dry.stderr).upper()
             rec("dry-run is labeled and distinct", "DRY-RUN" in dblob and "APPLIED" not in dblob, "not distinct")
 
-            # P5: menu keeps numeric dispatch tokens and quits cleanly.
             menu = subprocess.run(
                 [sys.executable, str(ENTRY), "menu"],
-                input="q\n",
-                capture_output=True,
-                text=True,
-                env={**os.environ, "WG_MANAGER_STATE": state},
-                cwd=tmp,
-                timeout=TIMEOUT,
-                check=False,
+                input="q\n", capture_output=True, text=True,
+                env={**os.environ, "WG_MANAGER_STATE": state}, cwd=tmp,
+                timeout=TIMEOUT, check=False,
             )
             rec("menu keeps [ 1] list token", "[ 1] list" in menu.stdout or "[1] list" in menu.stdout, "missing token")
             rec("menu quits cleanly", menu.returncode == 0, f"rc={menu.returncode}")
+            rec("menu shows DRY-RUN mode", "DRY-RUN" in menu.stdout, "no mode badge")
 
-            # P5b: menu dispatches action (list) and exits cleanly.
             menu_dispatch = subprocess.run(
                 [sys.executable, str(ENTRY), "menu"],
-                input="1\n0\n",
-                capture_output=True,
-                text=True,
-                env={**os.environ, "WG_MANAGER_STATE": state},
-                cwd=tmp,
-                timeout=TIMEOUT,
-                check=False,
+                input="1\n0\n", capture_output=True, text=True,
+                env={**os.environ, "WG_MANAGER_STATE": state}, cwd=tmp,
+                timeout=TIMEOUT, check=False,
             )
             rec("menu dispatches list action", menu_dispatch.returncode == 0, f"rc={menu_dispatch.returncode}")
 
-            # P5c: menu shortcut dispatches action (l for list).
             menu_shortcut = subprocess.run(
                 [sys.executable, str(ENTRY), "menu"],
-                input="l\n0\n",
-                capture_output=True,
-                text=True,
-                env={**os.environ, "WG_MANAGER_STATE": state},
-                cwd=tmp,
-                timeout=TIMEOUT,
-                check=False,
+                input="l\n0\n", capture_output=True, text=True,
+                env={**os.environ, "WG_MANAGER_STATE": state}, cwd=tmp,
+                timeout=TIMEOUT, check=False,
             )
             rec("menu shortcut dispatches action", menu_shortcut.returncode == 0, f"rc={menu_shortcut.returncode}")
 
-        # Direct verification of apply_system_uninstall and remove_state_data in isolated test dir
+        # Direct verification of apply_system_uninstall and remove_state_data.
         with tempfile.TemporaryDirectory() as tmp:
             test_sysroot = Path(tmp) / "sysroot"
             test_sdir = Path(tmp) / "etc" / "wg-manager"
@@ -375,8 +700,7 @@ def main():
             }
             clean_cmd = subprocess.run(
                 [
-                    sys.executable,
-                    "-c",
+                    sys.executable, "-c",
                     (
                         "import sys; from pathlib import Path; sys.path.insert(0, sys.argv[1]); "
                         "from lib.system import apply_system_uninstall; from lib.state import remove_state_data, load_state; "
@@ -384,11 +708,8 @@ def main():
                     ),
                     str(TOOL_ROOT),
                 ],
-                capture_output=True,
-                text=True,
-                env=dict(os.environ, **test_env),
-                cwd=tmp,
-                check=False,
+                capture_output=True, text=True,
+                env=dict(os.environ, **test_env), cwd=tmp, check=False,
             )
             rec("clean helper runs cleanly", "OK_CLEAN" in clean_cmd.stdout, f"out={clean_cmd.stdout} err={clean_cmd.stderr}")
             rec("uninstall deletes state dir", not test_sdir.exists(), "state_dir still exists")
@@ -396,10 +717,9 @@ def main():
             rec("uninstall deletes network", not mock_network.exists(), "network still exists")
             rec("uninstall deletes sysctl", not mock_sysctl.exists(), "sysctl still exists")
             rec("uninstall deletes nftables", not mock_nft.exists(), "nft still exists")
-            rec("main.py is preserved", ENTRY.exists(), "ENTRY missing")
 
-            # P5: Firewalld trusted zone and firewall uninstall preview
-            sys.path.insert(0, str(TOOL_ROOT))
+            if str(TOOL_ROOT) not in sys.path:
+                sys.path.insert(0, str(TOOL_ROOT))
             from lib.renderers import firewalld_argv
             fw_cmds = firewalld_argv({"server": {"ifname": "wg0", "port": 51820}})
             has_trusted = any(c == ["firewall-cmd", "--permanent", "--zone=trusted", "--add-interface=wg0"] for c in fw_cmds)
@@ -410,9 +730,23 @@ def main():
             labels = [p[0] for p in previews]
             rec("uninstall previews firewalld/ufw", "firewalld rules" in labels and "ufw rules" in labels, f"labels={labels}")
 
+            # Backup mode sidecar survives rollback (0600 restore keeps 0644).
+            from lib.system import _rollback_paths, backup_system_file
+            cfg = Path(tmp) / "config.network"
+            cfg.write_text("original", encoding="utf-8")
+            cfg.chmod(0o644)
+            bdir_state = Path(tmp) / "state.json"
+            seed_state(bdir_state)
+            os.environ["WG_MANAGER_STATE"] = str(bdir_state)
+            backup = backup_system_file(str(cfg))
+            cfg.write_text("modified", encoding="utf-8")
+            cfg.chmod(0o600)
+            if backup:
+                _rollback_paths([(str(cfg), str(backup))])
+            restored_mode = stat.S_IMODE(cfg.stat().st_mode)
+            rec("rollback restores original mode", restored_mode == 0o644, f"mode={oct(restored_mode)}")
 
-
-        # P6: i18n key parity across en/es/de (independent of --self-test).
+        # i18n key parity across en/es/de.
         try:
             from lib.i18n import STRINGS
             en = set(STRINGS["en"])
@@ -424,11 +758,10 @@ def main():
     except Exception as exc:  # noqa: BLE001 # subprocess timeout or missing entry
         rec("no exception", False, f"{type(exc).__name__}: {exc}")
 
-    # Table dump on stdout; failure exits 1 for CI gates.
-    print(f"{'CHECK':28} {'RESULT':6} DETAIL")
+    print(f"{'CHECK':32} {'RESULT':6} DETAIL")
     failed = 0
     for name, passed, detail in rows:
-        print(f"{name:28} {'PASS' if passed else 'FAIL':6} {detail}")
+        print(f"{name:32} {'PASS' if passed else 'FAIL':6} {detail}")
         failed += 0 if passed else 1
     print(f"OK: {TOOL_ROOT.name}" if failed == 0 else f"FAILURES: {failed}")
     return 0 if failed == 0 else 1

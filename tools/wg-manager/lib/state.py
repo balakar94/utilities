@@ -5,6 +5,7 @@ import os
 import re
 import secrets
 import shutil
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -13,14 +14,147 @@ try:
 except ImportError:
     fcntl = None
 
-from .constants import DEFAULT_STATE_PATH, SCHEMA_VERSION
+from .constants import DEFAULT_STATE_PATH, IFNAME_RE, NAME_RE, SCHEMA_VERSION
 from .i18n import t
 from .presentation import eprint
+
+# ---------------------------------------------------------------- schema
+# Registry of migrations: from_version -> callable(data) -> data.
+# Kept explicit so a future bump cannot silently accept old shapes.
+MIGRATIONS = {}
+
+_PEER_ROLES = ("client", "infra")
+_PEER_TRAFFIC = ("server-only", "custom-routes", "full-tunnel")
+_PEER_DNS_SCOPES = ("none", "tunnel", "all")
+_IPV6_MODES = ("disabled", "ula", "routed", "nat66")
+_BACKENDS = ("networkd", "nm")
+_FIREWALLS = ("nft", "firewalld")
+
+
+def _bad(detail):
+    raise ValueError(t("err_state_invalid").format(detail=detail))
+
+
+def _is_int(value):
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _check_peer(peer, index):
+    where = "peers[" + str(index) + "]"
+    if not isinstance(peer, dict):
+        _bad(where + " is not an object")
+    name = peer.get("name")
+    if not isinstance(name, str) or not NAME_RE.match(name) or ".." in name or "/" in name:
+        _bad(where + ".name")
+    role = peer.get("role", "client")
+    if role not in _PEER_ROLES:
+        _bad(where + ".role")
+    traffic = peer.get("traffic")
+    if traffic is not None and traffic not in _PEER_TRAFFIC:
+        _bad(where + ".traffic")
+    dns_scope = peer.get("dns_scope")
+    if dns_scope is not None and dns_scope not in _PEER_DNS_SCOPES:
+        _bad(where + ".dns_scope")
+    for key in ("v4", "v6", "pubkey", "privkey", "psk", "pool", "endpoint"):
+        value = peer.get(key)
+        if value is not None and not isinstance(value, str):
+            _bad(where + "." + key)
+    for key in ("keepalive", "expires_at"):
+        value = peer.get(key)
+        if value is not None and not _is_int(value):
+            _bad(where + "." + key)
+    for key in ("enabled", "tombstoned", "needs_reissue"):
+        value = peer.get(key)
+        if value is not None and not isinstance(value, bool):
+            _bad(where + "." + key)
+    routes = peer.get("custom_routes")
+    if routes is not None and not isinstance(routes, list):
+        _bad(where + ".custom_routes")
+
+
+def _check_server(server):
+    if not isinstance(server, dict):
+        _bad("server is not an object")
+    for key in ("endpoint", "ifname", "wan_iface", "backend", "firewall", "private_key", "public_key"):
+        value = server.get(key)
+        if value is not None and not isinstance(value, str):
+            _bad("server." + key)
+    ifname = server.get("ifname")
+    if ifname is not None and not IFNAME_RE.match(ifname):
+        _bad("server.ifname")
+    backend = server.get("backend")
+    if backend is not None and backend not in _BACKENDS:
+        _bad("server.backend")
+    firewall = server.get("firewall")
+    if firewall is not None and firewall not in _FIREWALLS:
+        _bad("server.firewall")
+    for key in ("port", "mtu"):
+        value = server.get(key)
+        if value is not None and not _is_int(value):
+            _bad("server." + key)
+    if _is_int(server.get("port")) and not 1 <= server["port"] <= 65535:
+        _bad("server.port range")
+    if _is_int(server.get("mtu")) and not 1280 <= server["mtu"] <= 9000:
+        _bad("server.mtu range")
+    original = server.get("sysctl_original")
+    if original is not None and not isinstance(original, dict):
+        _bad("server.sysctl_original")
+
+
+def validate_state(data):
+    """Reject structurally invalid state before any command touches it."""
+    if not isinstance(data, dict):
+        _bad("state root is not an object")
+    version = data.get("schema_version", SCHEMA_VERSION)
+    if not _is_int(version) or version > SCHEMA_VERSION or version < 1:
+        raise ValueError(t("err_state_schema").format(version=version, expected=SCHEMA_VERSION))
+    server = data.get("server", {})
+    if not isinstance(server, dict):
+        _bad("server is not an object")
+    _check_server(server)
+    for section in ("ipv4", "ipv6"):
+        value = data.get(section, {})
+        if not isinstance(value, dict):
+            _bad(section + " is not an object")
+    ipv6_mode = data.get("ipv6", {}).get("mode")
+    if ipv6_mode is not None and ipv6_mode not in _IPV6_MODES:
+        _bad("ipv6.mode")
+    for section in ("pools_v4", "pools_v6", "peers"):
+        value = data.get(section, [])
+        if not isinstance(value, list):
+            _bad(section + " is not a list")
+    for index, peer in enumerate(data.get("peers", [])):
+        _check_peer(peer, index)
+    return True
+
+
+def migrate_state(data):
+    """Apply schema migrations and stamp the current version."""
+    if not isinstance(data, dict):
+        _bad("state root is not an object")
+    version = data.get("schema_version")
+    if version is None:
+        version = 0
+    if not _is_int(version) or version > SCHEMA_VERSION:
+        raise ValueError(t("err_state_schema").format(version=version, expected=SCHEMA_VERSION))
+    while version < SCHEMA_VERSION:
+        migration = MIGRATIONS.get(version)
+        if migration is not None:
+            data = migration(data)
+        version += 1
+        data["schema_version"] = version
+    return data
 
 
 # ---------------------------------------------------------------- state
 def state_path():
-    return Path(os.environ.get("WG_MANAGER_STATE", DEFAULT_STATE_PATH))
+    raw = os.environ.get("WG_MANAGER_STATE", DEFAULT_STATE_PATH)
+    p = Path(str(raw)).expanduser()
+    if not p.is_absolute():
+        raise ValueError(t("err_state_path").format(path=raw))
+    if ".." in p.parts:
+        raise ValueError(t("err_state_path").format(path=raw))
+    return p
 
 
 def state_dir():
@@ -56,19 +190,16 @@ def load_state():
         raise ValueError(t("err_state_corrupt").format(detail=exc))
     if not isinstance(data, dict):
         raise ValueError(t("err_state_corrupt").format(detail="not a dict"))  # noqa: TRY004
-    data.setdefault("schema_version", SCHEMA_VERSION)
+    data = migrate_state(data)
     data.setdefault("server", {})
     data.setdefault("ipv4", {})
     data.setdefault("ipv6", {})
     data.setdefault("pools_v4", [])
     data.setdefault("pools_v6", [])
     data.setdefault("peers", [])
-    # Audit fix: N10/N13 - reject wrong shapes instead of crashing later.
-    for key, typ in (("server", dict), ("ipv4", dict), ("ipv6", dict), ("pools_v4", list), ("pools_v6", list), ("peers", list)):
-        if not isinstance(data.get(key), typ):
-            raise ValueError(t("err_state_corrupt").format(detail="bad type for " + key))  # noqa: TRY004
-    if not all(isinstance(p, dict) for p in data.get("peers", [])):
-        raise ValueError(t("err_state_corrupt").format(detail="bad peer entry"))
+    # Audit fix: N10/N13 - reject wrong shapes and bad field types instead of
+    # crashing later during status/check.
+    validate_state(data)
     return data
 
 
@@ -166,16 +297,25 @@ def backup_state_file():
 
 
 @contextlib.contextmanager
-def state_lock():
-    """Audit fix: A4 - exclusive flock around state read-modify-write."""
+def state_lock(timeout=30.0):
+    """Exclusive flock around state read-modify-write, with a bounded wait.
+
+    The lock is taken with LOCK_NB in a retry loop so a stuck holder surfaces
+    as a localized error instead of hanging forever.
+    """
     lock_path = state_dir() / "state.lock"
     _mkdir_private(state_dir())
     with open(str(lock_path), "a+", encoding="utf-8") as fh:
         if fcntl is not None:
-            try:
-                fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
-            except OSError:
-                pass
+            deadline = time.monotonic() + max(0.0, float(timeout))
+            while True:
+                try:
+                    fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except OSError:
+                    if time.monotonic() >= deadline:
+                        raise ValueError(t("err_lock_timeout"))
+                    time.sleep(0.1)
         try:
             yield
         finally:
@@ -186,21 +326,17 @@ def state_lock():
                     pass
 
 
-def _state_file_candidates():
-    paths = []
-    env = os.environ.get("WG_MANAGER_STATE")
-    if env:
-        paths.append(Path(env).resolve())
-    paths.append(DEFAULT_STATE_PATH)
-    return paths
-
-
-def _load_state_silent():
-    """Load state quietly; return default empty state on missing or corrupt."""
-    try:
-        return load_state()
-    except Exception:  # noqa: BLE001
-        return default_state()
+@contextlib.contextmanager
+def locked_state(default_if_missing=False):
+    """Lock + freshly loaded state, so RMW cycles never race on stale reads."""
+    with state_lock():
+        try:
+            data = load_state()
+        except FileNotFoundError:
+            if not default_if_missing:
+                raise
+            data = default_state()
+        yield data
 
 
 def save_state(state):
@@ -212,6 +348,9 @@ def save_state(state):
 def _audit_clean(value):
     """Audit fix: N12 - keep audit.log one record per line (no log forging)."""
     return re.sub(r"[\r\n\x00]+", " ", str(value))
+
+
+AUDIT_MAX_BYTES = 1024 * 1024
 
 
 def audit(action, detail=""):
@@ -226,6 +365,17 @@ def audit(action, detail=""):
             os.chmod(p, 0o600)
         except OSError:
             pass
+        # Bound growth: rotate to audit.log.1 once the current file is too big.
+        try:
+            if p.stat().st_size > AUDIT_MAX_BYTES:
+                rotated = p.parent / "audit.log.1"
+                os.replace(str(p), str(rotated))
+                try:
+                    os.chmod(rotated, 0o600)
+                except OSError:
+                    pass
+        except OSError:
+            pass
     except OSError:
         pass
 
@@ -234,7 +384,7 @@ def list_backups():
     bdir = state_dir() / "backups"
     if not bdir.exists():
         return []
-    return sorted(bdir.glob("state-*.json"))
+    return sorted(list(bdir.glob("state-*.json")) + list(bdir.glob("manual-*.json")))
 def load_state_or_default(args):
     """Dry-run without state renders against defaults; --apply still requires state."""
     try:

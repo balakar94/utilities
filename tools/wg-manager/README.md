@@ -2,7 +2,7 @@
 
 > Guided native WireGuard server manager for Debian, RHEL, Fedora and Arch operators.
 
-Owner: `@balakar94` | Last-verified: `2026-09-14` | Status: `incubating` | License: `Apache-2.0`
+Owner: `@balakar94` | Last-verified: `2026-09-19` | Status: `incubating` | License: `Apache-2.0`
 
 ## Use for
 
@@ -12,24 +12,32 @@ Owner: `@balakar94` | Last-verified: `2026-09-14` | Status: `incubating` | Licen
 ## Not for
 
 - Web UIs like wg-easy -> CLI only.
-- Non-Linux hosts or resale VPN -> scoped Linux forwarding only.
+- Non-Linux hosts, Alpine (no systemd), or resale VPN -> scoped Linux forwarding only.
 
 ## Requirements
 
 - `python >= 3.11` stdlib only; `bash` for `install.sh`.
-- `wireguard-tools` (`wg`) for keys; supported firewall engines: `nftables`, `firewalld`, or `ufw`; `qrencode` optional.
-- `WG_MANAGER_STATE` override; `--lang auto|en|es|de`; no network for dry-run/self-test.
+- `wireguard-tools` (`wg`) for keys; one of `nftables`, `firewalld`, or `ufw`; `qrencode` optional.
+- `WG_MANAGER_STATE` overrides the state path; `WG_MANAGER_SYSROOT` is a test-only seam that redirects
+  system paths. `--lang auto|en|es|de`; dry-run and `--self-test` need no network.
 
 ## Impact
 
-- Level `system`. Writes binary (`0755`), `/etc/wg-manager/state.json` and `clients/*` (`0600`, dirs `0700`),
-  network units, firewall rules, sysctl.
-- Dry-run by default; `--apply --yes [--sudo]`; non-interactive `init --apply` needs `--set`.
-- Real keys via `wg genkey`/`wg pubkey`; renders refuse placeholder private keys.
-- Multi-firewall integration: safe tagged rules (`comment "wg-manager"`) in host `table inet filter` for
-  `nftables`, `trusted` zone assignment in `firewalld`, and native route/port rules in `ufw`.
-- Rollback: state and `sys-*` backups keep 20, `.bak` stamps, manifest, `rollback --to`, `install.sh --restore`.
-  Multi-engine cleanup on uninstall.
+- Level `system`. Writes the manager binary (`0755`, default `/usr/local/bin/wg-manager`), the install
+  manifest at `/var/lib/wg-manager/install-manifest.json`, and state at `/etc/wg-manager/state.json`
+  plus `clients/*` (`0600`, dirs `0700`).
+- System paths: `/etc/systemd/network/90-<ifname>.netdev` and `.network`,
+  `/etc/systemd/networkd.conf.d/80-wg-manager.conf`,
+  `/etc/NetworkManager/system-connections/wg-manager.nmconnection`, `/etc/sysctl.d/90-wg-manager.conf`,
+  `/etc/nftables.d/90-wg-manager.nft`, and `/etc/nftables.conf` (or `/etc/sysconfig/nftables.conf` on
+  RHEL). Also applies live sysctl values, firewall rules, and the WireGuard interface.
+- `install.sh --apply` installs distro packages and the zipapp under the chosen `--prefix`
+  (default `/usr/local`).
+- Real backups live under the state dir (`/etc/wg-manager/backups/`), never `/var/backups/`: `state-*`,
+  `sys-*`, and `manual-*` each keep the latest 20; `audit.log` rotates to `audit.log.1` above 1 MiB.
+- Rollback: `rollback --to <snapshot>` restores state and re-applies the network configuration;
+  `install.sh --restore` reverts the binary; `uninstall` restores the sysctls captured at first apply.
+- Privileges: dry-run by default; writes require `--apply --yes` plus root or `--sudo`.
 
 ## Quickstart
 
@@ -41,75 +49,85 @@ wg-manager init --dry-run
 wg-manager menu
 ```
 
-Expected: installer plan then `SELF-TEST PASS` then dry-run preview, exit `0`.
+Expected: installer plan, then `SELF-TEST PASS`, then a dry-run preview; exit `0`.
 
 ## Commands reference
 
-All commands are dry-run by default. Pass `--apply --yes [--sudo]` to commit changes to disk or system network units.
+All commands are dry-run by default; `--apply --yes [--sudo]` commits changes, and `--dry-run` always wins
+over `--apply`. `list`, `check`, and `status` accept `--json`.
 
 ### Interactive Console & Setup
 
-- `menu`: Full-screen TUI cockpit dashboard. Shows live status, telemetry summary, peers preview, and supports
-  numeric selection (`1`..`18`, `0`) or quick mnemonic letter shortcuts (`a` add, `l` list, `s` status, `c` check,
-  `r` reload, `b` backup, `q` quit).
+- `menu`: Full-screen TUI cockpit with live status, telemetry, and a peers preview. Starts in DRY-RUN;
+  press `A` to toggle `MODE: APPLY`. In APPLY, `delete`, `purge`, and `rollback` require typing the exact
+  action word, and the first run asks before writing. Select items by number (`1`..`17`, `0` exits), by
+  name (`reconfigure`/`reconfig`), or by shortcut (`a` add, `l` list, `s` status, `c` check, `r` reload,
+  `b` backup, `e` edit, `d` delete, `x` export, `w` reconfigure, `?` help, `q` quit).
 
   ```bash
   wg-manager menu
   ```
 
-- `init`: First-time server setup wizard. Prompts for endpoint, UDP port, MTU, interface name, network backend
-  (`networkd` or `NetworkManager`), firewall (`nftables` or `firewalld`), and IPv4/IPv6 pool ranges.
-  - Flags: `--force` (overwrite existing state), `--import-server-key <path>` (use existing private key), `--set
-    key=value` (scripted non-interactive setup).
+- `init`: First-time setup wizard. Prompts for endpoint, UDP port, MTU, interface name, backend
+  (`networkd` or `NetworkManager`), WAN interface, IPv4 prefix/hub, IPv6 mode/prefix/hub/WAN, DNS
+  servers, and the optional permanent (infra) pool. There is no firewall prompt: the engine is
+  auto-detected (RHEL family -> firewalld, else nft).
+  - Flags: `--force` (overwrite existing state), `--import-server-key <path>`, `--set key=value`
+    (repeatable; non-interactive `--apply` requires every required key).
 
   ```bash
   wg-manager init --dry-run
-  wg-manager init --apply --yes --sudo --set endpoint=vpn.example.com --set port=51820
+  wg-manager init --apply --yes --sudo \
+    --set endpoint=vpn.example.com --set port=51820 --set mtu=1420 \
+    --set ifname=wg0 --set backend=networkd --set wan_iface=eth0 \
+    --set ipv4_prefix=10.90.90.0/24 --set ipv4_hub=10.90.90.1 --set ipv6_mode=disabled
   ```
 
 ### Peer Lifecycle & IPAM
 
-- `add`: Add a new peer with guided IP allocation. In the interactive wizard, prompts for pre-shared key (PSK)
-  generation (default Yes for post-quantum security). Under `nat66` mode (even with a single WAN `/128`), clients
-  automatically receive a local ULA address (`fd90:90:90::/64`) and full-tunnel peers route `::/0` via server NAT66
-  masquerading.
-  - Flags: `--name <name>` (peer identifier), `--kind client|infra` (role), `--pool <name>` (target IP pool),
-    `--traffic server-only|custom-routes|full-tunnel`, `--routes <cidr,cidr>`, `--dns-scope none|tunnel|all`,
-    `--keepalive <sec>`, `--ip <ipv4>`, `--ip6 <ipv6>`, `--psk [key]` (generate or provide PSK), `--no-psk` (skip
-    PSK), `--expires <duration|date>`.
+- `add`: Add a peer with guided IP allocation. The wizard prompts for a pre-shared key (default yes);
+  prefer `--psk generate` or `--no-psk` so a literal key never lands in shell history. Under `nat66`,
+  clients get a local ULA (`fd90:90:90::/64`) and full-tunnel peers route `::/0` through server NAT66.
+  - Flags: `--name`, `--kind client|infra`, `--infra-type mikrotik|router|server`, `--pool`, `--traffic
+    server-only|custom-routes|full-tunnel`, `--routes`, `--dns-scope none|tunnel|all`, `--keepalive
+    0-120`, `--endpoint`, `--pubkey`, `--ip`, `--ip6`, `--psk [key]`, `--no-psk`,
+    `--expires <duration|date>`.
 
   ```bash
-  wg-manager add --name phone --kind client --traffic full-tunnel --psk
-  wg-manager add --name branch-router --kind infra --pubkey "PUBKEY..." --ip 10.90.90.10
+  wg-manager add --name phone --kind client --traffic full-tunnel --psk generate
+  wg-manager add --name branch-router --kind infra --ip 10.90.90.10
   ```
 
-- `list`: Display an aligned overview of all configured peers sorted permanents-first, including name, role,
-  assigned IPv4, IPv6, and operational status (`active`, `disabled`, `tombstoned`).
+- `list`: Permanents-first table with name, role, IPv4, IPv6, and state (`enabled`, `disabled`,
+  `expired`, `reissue`, `tombstoned`). `--json` prints `total`, `active`, `infra`, `clients`,
+  `tombstoned`, `reissue`, and `peers[]` (`name`, `role`, `v4`, `v6`, `state`, `enabled`,
+  `tombstoned`).
 
   ```bash
   wg-manager list
+  wg-manager list --json
   ```
 
-- `edit`: Modify peer attributes in place. Supports key rotation, traffic profile updates, pool migration, and IP
-  reallocation.
-  - Flags: `[name]`, `--new-name <name>`, `--endpoint <host:port>`, `--traffic <mode>`, `--routes <list>`,
-    `--keepalive <sec>`, `--rotate-keys` (generates fresh keys), `--keep-psk`, `--reclaim-ip`.
+- `edit`: Rename a peer or change endpoint, traffic profile, routes, DNS scope, keepalive, pool,
+  allocation, expiry, and enabled state.
+  - Flags: `[name]`, `--new-name`, `--endpoint`, `--traffic`, `--routes`, `--dns-scope`, `--keepalive`,
+    `--move-pool`, `--rotate-keys`, `--keep-psk`, `--reclaim-ip`, `--pubkey`, `--expires`, `--enable`,
+    `--disable`.
 
   ```bash
-  wg-manager edit phone --traffic split --keepalive 25
+  wg-manager edit phone --traffic custom-routes --keepalive 25
   wg-manager edit phone --rotate-keys
   ```
 
-- `enable` / `disable`: Temporarily pause or re-activate a peer on the WireGuard interface without releasing its
-  assigned IP address.
+- `enable` / `disable`: Temporarily pause or re-activate a peer without releasing its assigned address.
 
   ```bash
   wg-manager disable phone
   wg-manager enable phone
   ```
 
-- `delete`: Tombstone a peer. Marks the peer inactive and removes it from the WireGuard interface configuration,
-  but keeps its IP address reserved in state to prevent accidental IP reassignment.
+- `delete`: Tombstone a peer. Marks it inactive and removes it from the interface configuration, but
+  keeps its IP reserved in state to prevent accidental reassignment.
 
   ```bash
   wg-manager delete phone
@@ -130,24 +148,25 @@ All commands are dry-run by default. Pass `--apply --yes [--sudo]` to commit cha
 
 ### Client Configuration & QR
 
-- `show`: Display rendered client WireGuard configuration file (`wg0.conf`). Sensitive private keys and pre-shared
-  keys are redacted with asterisks by default.
-  - Flags: `[name]`, `--show-secrets` (reveal keys in plaintext).
+- `show`: Display the rendered peer configuration. Private and pre-shared keys are redacted with
+  asterisks unless `--show-secrets` is passed.
+  - Flags: `[name]`, `--show-secrets`.
 
   ```bash
   wg-manager show phone
   wg-manager show phone --show-secrets
   ```
 
-- `qr`: Generate and print an ASCII QR code in the terminal for mobile device configuration scanning (iOS and
-  Android WireGuard apps).
+- `qr`: Generate an ASCII QR code in the terminal for the iOS and Android WireGuard apps; falls back
+  to plain text when `qrencode` is missing.
 
   ```bash
   wg-manager qr phone
   ```
 
-- `export`: Export ready-to-use client `.conf` files to disk with restrictive `0600` permissions.
-  - Flags: `[name]`, `--all` (export all enabled clients), `--out-dir <dir>` (destination directory).
+- `export`: Export ready-to-use client `.conf` files (`0600`) using atomic writes that never follow
+  symlinks; state-derived names are validated and the destination directory is created `0700`.
+  - Flags: `[name]`, `--all` (all enabled clients), `--out-dir <dir>`.
 
   ```bash
   wg-manager export phone --out-dir ~/wireguard-clients
@@ -156,24 +175,20 @@ All commands are dry-run by default. Pass `--apply --yes [--sudo]` to commit cha
 
 ### Server Operations & Telemetry
 
-- `status`: Query live WireGuard kernel interface via `wg show <ifname> dump`. Displays latest handshake age,
-  transfer byte counters, and active remote endpoints.
+- `status`: Query the live WireGuard interface (`wg show <ifname> dump`) for handshake age, transfer
+  counters, and active endpoints. `--json` prints `interface`, `interface_present`, `peers[]` (`name`,
+  `v4`, `status`, `handshake_seconds`, `rx_bytes`, `tx_bytes`, `endpoint`, `enabled`, `tombstoned`),
+  `online`, and `total`.
 
   ```bash
   wg-manager status
+  wg-manager status --json
   ```
 
-- `reload`: Render native network backend units (`systemd.netdev`/`network` with dual `IPForward`/`IPv4Forwarding`
-  and networkd drop-in, or NetworkManager keyfiles) and firewall rules, apply changes, perform in-kernel live peer
-  synchronization via `wg syncconf`, and verify link health with automatic rollback on failure.
-  - Multi-firewall integration:
-    - **`nftables`**: Renders pure unified `table inet wg_manager` with scoped NAT masquerade (`oifname !=
-      <ifname>`). Integrates with host `table inet filter` by adding tagged rules (`comment "wg-manager"`) to
-      prevent host-level drop policy conflicts.
-    - **`firewalld`**: Adds interface to the `trusted` zone (`--zone=trusted --add-interface=<ifname>`) preventing
-      inter-zone forwarding drops in firewalld $\ge 0.9.0$, opens listen port, and enables masquerade.
-    - **`ufw`**: Detects active UFW daemon, allowing the UDP listen port and interface routed forwarding (`ufw
-      route allow in on <ifname>`).
+- `reload`: Render native backend units and firewall rules (`nftables`, `firewalld`, or `ufw`), apply,
+  sync peers in-kernel via `wg syncconf`, and verify link health with automatic rollback on failure. A
+  successful apply records the chosen backend and firewall in state (`server.backend`,
+  `server.firewall`); every later system apply, `check`, and `rollback` reuses them.
   - Flags: `--backend networkd|nm`, `--firewall nft|firewalld`.
 
   ```bash
@@ -181,20 +196,22 @@ All commands are dry-run by default. Pass `--apply --yes [--sudo]` to commit cha
   wg-manager reload --apply --yes --sudo
   ```
 
-- `check`: Run comprehensive system health checks. Verifies Curve25519 key shapes, IPv4 forwarding sysctl
-  (`net.ipv4.ip_forward=1`), backend daemon status, and audits firewall engines:
-  - **`nftables`**: Detects if host `table inet filter` has a drop policy and verifies presence of `wg-manager`
-    input/forward rules.
-  - **`firewalld`**: Verifies if running and checks whether `<ifname>` is assigned to the `trusted` zone.
-  - **`ufw`**: Verifies if active and validates that the WireGuard port and routing rules are allowed.
+- `check`: Run health checks: Curve25519 key shapes, IPv4 forwarding sysctl
+  (`net.ipv4.ip_forward=1`), backend daemon status, the active firewall engine (tagged nftables rules
+  and drop policies, firewalld `trusted` zone, ufw port/routing), MTU/MSS clamping, and handshake age.
+  Disabled peers are skipped, so they never raise false handshake warnings.
+  - `--json` prints `results[].status|message` (`ok`, `warn`, `err`, `skip`) plus `passed`, `warnings`,
+    `failed`, `skipped`. Exits `1` when any check reports `err`, `0` otherwise.
 
   ```bash
   wg-manager check
+  wg-manager check --json
   ```
 
-- `reconfigure`: Update server-level networking configuration (public endpoint hostname/IP, listen port, MTU, IPv6
-  operational mode). Warns when client configurations require QR regeneration.
-  - Flags: `--endpoint <host>`, `--port <port>`, `--mtu <mtu>`, `--ipv6-mode disabled|ula|delegated`.
+- `reconfigure`: Update server-level networking (public endpoint, listen port, MTU, WAN interface, IPv6
+  operational mode/prefix/WAN). Warns when client configurations require QR regeneration.
+  - Flags: `--endpoint <host>`, `--port <port>`, `--mtu <1280-9000>`, `--wan <ifname>`, `--ipv6-mode
+    disabled|ula|routed|nat66`, `--ipv6-prefix <cidr>`, `--ipv6-wan <addr|prefix>`.
 
   ```bash
   wg-manager reconfigure --endpoint vpn2.example.com --dry-run
@@ -202,27 +219,26 @@ All commands are dry-run by default. Pass `--apply --yes [--sudo]` to commit cha
 
 ### Safety, Backup & Recovery
 
-- `backup`: Create an atomic snapshot of `/etc/wg-manager/state.json` stored in `/var/backups/wg-manager/` (keeps
-  latest 20 backups automatically).
+- `backup`: Create an atomic snapshot of `<state_dir>/state.json` under
+  `<state_dir>/backups/manual-<timestamp>.json` (`0600`, keeps the latest 20).
   - Flags: `--output <path>` (custom target path).
 
   ```bash
   wg-manager backup
   ```
 
-- `rollback`: Restore a previous state snapshot and roll back system network configuration.
-  - Flags: `--list` (show available backups with timestamps), `--to <path>` (target backup file).
+- `rollback`: Restore a previous state snapshot and re-apply the network configuration it describes.
+  - Flags: `--list` (show state and manual snapshots with timestamps), `--to <path>` (target backup file).
 
   ```bash
   wg-manager rollback --list
-  wg-manager rollback --to /var/backups/wg-manager/state.json.bak.20260914120000 --apply --yes --sudo
+  wg-manager rollback --to /etc/wg-manager/backups/state-20260919T120000-abcd1234.json --apply --yes --sudo
   ```
 
-- `uninstall` / `--uninstall`: Remove all server configuration, WireGuard interface, sysctl files, firewall rules,
-  and state directory (`/etc/wg-manager`), resetting the server to a clean default state for a fresh start or
-  reinstall. Does not remove the `wg-manager` binary itself.
-  - Cleans up across all firewall engines: deletes `wg_manager` nftables tables and tagged rules in host `inet
-    filter`, removes interface and port from firewalld, and deletes UFW route and port rules.
+- `uninstall` / `--uninstall`: Remove the WireGuard interface, network units, sysctl file, firewall
+  rules, and the state directory (`/etc/wg-manager`), resetting the host for a fresh start. Restores
+  the sysctl values captured at first apply and removes firewalld masquerade and rich rules. Does not
+  remove the `wg-manager` binary itself.
   - Flags: `--dry-run`, `--apply --yes [--sudo]`.
 
   ```bash
@@ -236,71 +252,89 @@ All commands are dry-run by default. Pass `--apply --yes [--sudo]` to commit cha
 - `--uninstall`: Trigger server configuration uninstallation and data wipe.
 - `--apply`: Commit writes to disk, systemd units, and firewall rules (default is read-only / dry-run).
 - `--yes`: Confirm non-interactive execution without interactive prompts.
-- `--sudo`: Escalate with `sudo -n` when not executed as root.
-- `--dry-run`: Explicitly run in preview mode; renders configuration documents without writing.
-- `--show-secrets`: Print sensitive private keys and pre-shared keys in stdout instead of redacting.
+- `--sudo`: When not root, re-execute the real entrypoint (installed zipapp or repo `main.py`) through
+  `sudo`.
+- `--dry-run`: Explicit preview; always wins over `--apply`, so both flags together never write.
+- `--show-secrets`: Print private keys and pre-shared keys to stdout instead of redacting.
 - `--lang {auto,en,es,de}`: Force language or auto-detect system locale.
 - `--color {always,auto,never}` / `--no-color`: Control ANSI color output.
-- `--width <N>`: Set column wrapping width for narrow or wide terminals (clamped 40-200, default 80).
+- `--width <N>`: Set column wrapping width (40-200, auto by default).
 - `--self-test`: Run offline audit verifying key formats, nftables safety, regexes, and IPAM allocation.
 - `--version`: Print program name and version (`1.0.0`).
 - `--help`: Display usage syntax and subcommand list.
 
 ## Firewall & Routing Architecture
 
-`wg-manager` is designed to be complementary and non-destructive to host network configurations:
+`wg-manager` complements host network configurations without overwriting them:
 
-- **`nftables` (Arch Linux, Debian, Alpine)**:
-  - Manages isolated tables `inet wg_manager`, `ip wg_manager_nat4`, and `ip6 wg_manager_nat6`.
-  - Scoped NAT: Masquerades traffic only when exiting through non-WireGuard interfaces (`oifname != <ifname>`).
-  - Base Chain Coexistence: Automatically integrates with existing host filter tables (e.g., `/etc/nftables.conf`
-    with `policy drop`) by inserting tagged rules (`comment "wg-manager"`). On uninstall, only tagged rules are
-    removed.
-  - MSS Clamping: Dynamic `tcp flags syn tcp option maxseg size set rt mtu` adapts segment size to route MTU.
-- **`firewalld` (RHEL, Fedora, CentOS, AlmaLinux, Rocky)**:
-  - Automatically places the WireGuard interface into the `trusted` zone. This resolves inter-zone forwarding drops
-    introduced in firewalld $\ge 0.9.0$.
-  - Opens UDP listen port and enables masquerading on the active WAN zone.
-  - Applies TCPMSS clamping via `--clamp-mss-to-pmtu` in forward chains.
-  - Cleanly removes the interface from `trusted`, closes the UDP port, and removes direct MSS rules on uninstall.
-- **`ufw` (Ubuntu, Debian)**:
-  - Inter-operates with active UFW installations without modifying core `/etc/default/ufw` files.
-  - Automatically applies `ufw allow <port>/udp comment "wg-manager"` and `ufw route allow in on <ifname>`.
-  - Deletes both rules upon `uninstall`.
-- **MSS Clamping & MTU Mechanics (IPoE vs PPPoE)**:
-  - Server uplinks typically use IPoE (MTU 1500), where default WireGuard MTU is 1420 (leaving 80 bytes for
-    IPv6/WireGuard envelope).
-  - Residential/fiber uplinks often use PPPoE (MTU 1492), requiring a WireGuard MTU of 1412.
-  - `wg-manager check` inspects WAN MTU and alerts if WireGuard MTU exceeds `max(1280, wan_mtu - 80)`.
-  - Both `nftables` (`set rt mtu`) and `firewalld` (`--clamp-mss-to-pmtu`) automatically adjust TCP SYN packets,
-    eliminating MTU blackholes.
-- **SELinux & AppArmor Support**:
-  - **SELinux**: System unit files and state writes automatically invoke `restorecon -F` to ensure correct SELinux
-    security contexts (`systemd_networkd_unit_file_t`, `NetworkManager_etc_rw_t`, `etc_t`). Audited in `wg-manager
-    check`.
-  - **AppArmor**: Operates seamlessly with AppArmor; WireGuard runs in-kernel without user-space confinement
-    issues. Audited in `wg-manager check`.
-- **IPv6 Dual-Stack Modes**:
-  - `disabled`: IPv6 networking completely omitted; only IPv4 allocated.
-  - `ula`: Assigns unique local IPv6 addresses (`fd90:90:90::/64`) for local peer-to-peer and peer-to-server
-    traffic. Completely agnostic of external IPv6 internet; no NAT66 applied.
-  - `routed`: Used when a dedicated public `/64` prefix is routed exclusively to the WireGuard server. Packets are
-    routed end-to-end natively without any NAT.
-  - `nat66`: Tailored for VPS providers offering only a single `/128` (e.g. IONOS, Hetzner Cloud). Assigns internal
-    ULA addresses to clients and masquerades outbound client IPv6 traffic through the server's single WAN IPv6
-    address.
-- **Systemd Forwarding & Reverse Path Filtering**:
-  - Emits dual systemd network keys `IPForward=yes` and `IPv4Forwarding=yes` for universal systemd support (v245
-    through v256+).
-  - Configures `/etc/systemd/networkd.conf.d/80-wg-manager.conf` for host-wide networkd packet forwarding.
-  - Configures loose reverse path filtering (`net.ipv4.conf.all.rp_filter = 2` and `default.rp_filter = 2`) to
-    enable asymmetric tunnel routing without packet drops.
+- **`nftables` (Debian, Ubuntu, Arch)**: manages isolated tables `inet wg_manager`, `ip wg_manager_nat4`,
+  and `ip6 wg_manager_nat6`, scopes NAT masquerade to non-WireGuard egress (`oifname != <ifname>`), and
+  inserts tagged rules (`comment "wg-manager"`) into the host filter table so a host `policy drop` keeps
+  working; uninstall removes only tagged rules. MSS is clamped dynamically with
+  `tcp flags syn tcp option maxseg size set rt mtu`.
+- **`firewalld` (RHEL, Fedora, CentOS, AlmaLinux, Rocky)**: assigns the interface to the `trusted` zone,
+  resolving inter-zone forwarding drops introduced in firewalld >= 0.9.0, opens the UDP port, enables
+  masquerade, and clamps MSS via `--clamp-mss-to-pmtu`. Uninstall removes interface, port, masquerade,
+  rich rules, and direct MSS rules.
+- **`ufw` (Ubuntu, Debian)**: when active, allows the UDP port and routed forwarding
+  (`ufw route allow in on <ifname>`); both rules are deleted on uninstall.
+- **MTU mechanics**: IPoE uplinks default to WireGuard MTU 1420; PPPoE (uplink MTU 1492) needs 1412.
+  `check` warns when the WireGuard MTU exceeds `max(1280, wan_mtu - 80)`; `reconfigure --mtu` accepts
+  `1280-9000`.
+- **SELinux & AppArmor**: system unit and config writes run `restorecon -F` for correct contexts; both
+  are audited by `check`.
+- **IPv6 modes**: `disabled` (IPv4 only), `ula` (`fd90:90:90::/64`, no NAT66), `routed` (public `/64`
+  routed natively), `nat66` (single `/128`, ULA clients masqueraded through the WAN address).
+- **Systemd forwarding**: writes `/etc/systemd/networkd.conf.d/80-wg-manager.conf` with
+  `IPv4Forwarding=yes` (systemd >= 256) or `IPForward=yes` (older), both when the version is unknown,
+  plus `IPv6Forwarding=yes` when IPv6 is enabled; sets loose reverse path filtering (`rp_filter = 2`).
+
+## Exit codes
+
+| Code | Meaning |
+| --- | --- |
+| `0` | Success. |
+| `1` | Execution or state failure (`check` also returns `1` when a check reports `err`). |
+| `2` | Usage error (bad flags, missing `--yes`, incomplete non-interactive `init`). |
+| `130` | Interrupted (Ctrl-C). |
+
+## Troubleshooting
+
+- `wg: command not found` -> `wireguard-tools` is missing -> install it (`apt install wireguard-tools`,
+  `dnf install wireguard-tools`, `pacman -S wireguard-tools`; RHEL may need EPEL).
+- `systemd-networkd inactive` -> the selected backend service is not running -> start and enable
+  `systemd-networkd`, or re-run with `--backend nm`.
+- `nft` absent -> the apply is refused because the nftables engine cannot run -> install `nftables`, or
+  select `--firewall firewalld`.
+- Peers never handshake -> blocked UDP port, MTU too high, or a key/PSK mismatch -> open the UDP port,
+  lower `--mtu` (for example 1412 on PPPoE), and re-issue client configs with `show`/`qr`/`export`.
+- State corrupt or invalid -> malformed JSON or a failed schema/type/name validation -> restore with
+  `rollback --to <state snapshot>` from `<state_dir>/backups/`.
+- `check` in Docker -> a `drop` policy in `ip filter FORWARD` blocks forwarded tunnel traffic -> add an
+  accept for `<ifname>` before the drop, or keep WireGuard off that path.
+
+## Compatibility
+
+| Platform | Backend | Firewall |
+| --- | --- | --- |
+| Debian / Ubuntu | systemd-networkd (or NetworkManager) | nftables or ufw |
+| RHEL / Fedora / Alma / Rocky | NetworkManager (`nm`) | firewalld |
+| Arch | systemd-networkd | nftables |
+| Alpine | not supported (no systemd) | - |
+
+RHEL-family hosts may need EPEL for `wireguard-tools`.
+
+## Security
+
+- State contains server and peer private keys: `state.json` is `0600` inside a `0700` directory, and
+  the rotating backups (`state-*`, `sys-*`, `manual-*`, kept to 20 each) carry the same sensitivity.
+- `--show-secrets` prints private and pre-shared keys to stdout; treat that output as sensitive.
+- The state file is not encrypted at rest (roadmap item).
 
 ## Limits & status
 
-- CI is offline; live handshakes need staging VMs.
-- RHEL may need EPEL for `wireguard-tools`.
-- Changing IPv6 mode invalidates addresses; regenerate every QR and router file.
+- CI is offline; live handshakes and kernel applies need staging VMs or hosts.
+- Changing the IPv6 mode or prefixes invalidates addresses; regenerate every QR and router file.
 
 ## License & credits
 
