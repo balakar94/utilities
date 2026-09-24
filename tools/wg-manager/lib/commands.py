@@ -49,6 +49,8 @@ from .presentation import (
     wrap_text,
 )
 from .renderers import (
+    _is_active_peer,
+    _peer_is_expired,
     redact_text,
     render_client_conf,
     render_firewalld,
@@ -82,6 +84,7 @@ from .state import (
 )
 from .system import (
     _family_default_backend,
+    _link_kind,
     _precheck_backend,
     apply_system_reload,
     apply_system_uninstall,
@@ -213,11 +216,14 @@ def _chain_has_drop_policy(text, chain_name):
 
 
 # ---------------------------------------------------------------- init wizard
-def cmd_init(args):
-    # Guard: init is first-time-only; refuse when state exists unless --force.
-    if _is_initialized() and not getattr(args, "force", False):
-        eprint(t("err_already_init").format(path=str(state_path())))
-        raise SystemExit(1)
+def _collect_init_proposal(args):
+    """Run the init questionnaire once and return (state, answers).
+
+    `state` is the validated pre-key server state; `answers` maps --set keys
+    to the raw strings the operator gave, so the exact proposal can be
+    replayed non-interactively via --set (the TUI first-run flow uses this
+    to prompt only once). Raises SystemExit on validation/guard failures.
+    """
     # Audit fix: A6 - explicit inputs required when stdin is not a terminal.
     try:
         provided = parse_set_pairs(getattr(args, "set", None))
@@ -226,14 +232,18 @@ def cmd_init(args):
         raise SystemExit(1)
     tty = _stdin_isatty()
     dflt = default_state()
+    answers = {}
     if tty:
         print(paint(t("msg_wizard_hint"), "muted", args) + "\n")
 
     def ask(key, prompt, default):
         if key in provided:
+            answers[key] = provided[key]
             return provided[key]
         if tty:
-            return prompt_value(prompt, default)
+            raw = prompt_value(prompt, default)
+            answers[key] = raw
+            return raw
         return default
 
     def ask_valid(key, prompt, default, validator):
@@ -275,11 +285,8 @@ def cmd_init(args):
     wan_v6 = ""
     if v6mode != "disabled":
         base = "fd90:90:90::/64" if v6mode in ("ula", "nat66") else "2001:db8:1234:9000::/64"
-        if v6mode in ("ula", "nat66"):
-            v6prefix = ask_valid("ipv6_prefix", t("q_ipv6_prefix").format(default=base), base,
-                                 lambda raw: validate_reconfigure_prefix(v6mode, raw))
-        else:
-            v6prefix = validate_prefix(ask("ipv6_prefix", t("q_ipv6_prefix").format(default=base), base))
+        v6prefix = ask_valid("ipv6_prefix", t("q_ipv6_prefix").format(default=base), base,
+                             lambda raw: validate_reconfigure_prefix(v6mode, raw))
         hub_base = str(ipaddress.ip_network(v6prefix, strict=False).network_address + 1)
         v6hub = validate_ip(ask("ipv6_hub", t("q_ipv6_hub").format(default=hub_base), hub_base))
         wan_v6 = ask("ipv6_wan", t("q_wan_v6").format(default=""), "")
@@ -307,8 +314,10 @@ def cmd_init(args):
             raise SystemExit(1)
     if "permanent" in provided:
         want_perm = is_yes(provided["permanent"])
+        answers["permanent"] = provided["permanent"]
     elif tty:
         want_perm = prompt_yesno("q_permanent")
+        answers["permanent"] = "yes" if want_perm else "no"
     else:
         want_perm = False
     pools_v4 = []
@@ -342,7 +351,7 @@ def cmd_init(args):
             missing.append("clients")
         if missing:
             eprint(t("err_init_noninteractive").format(keys=",".join(missing)))
-            return 2
+            raise SystemExit(2)
     infra_prompt_default = to_short_span(infra_default, v4prefix) if tty else infra_default
     clients_prompt_default = to_short_span(clients_default, v4prefix) if tty else clients_default
     infra_range = ""
@@ -366,29 +375,47 @@ def cmd_init(args):
             pools_v6.append({"name": "clients", "range": v6clients_default, "kind": "next-free"})
     state = {
         "schema_version": SCHEMA_VERSION,
-        "server": {"endpoint": endpoint, "port": port, "mtu": mtu, "ifname": ifname, "backend": backend, "wan_iface": wan_iface, "dns": dns},
+        "server": {"endpoint": endpoint, "port": port, "mtu": mtu, "ifname": ifname, "backend": backend, "wan_iface": wan_iface, "dns": dns, "firewall": detect_firewall_default()},
         "ipv4": {"prefix": v4prefix, "hub": v4hub},
         "ipv6": {"mode": v6mode, "prefix": v6prefix, "hub": v6hub, "wan_v6": wan_v6},
         "pools_v4": pools_v4,
         "pools_v6": pools_v6,
         "peers": [],
     }
+    if ifname == wan_iface:
+        eprint(t("err_invalid_ifname").format(value="ifname == wan_iface (" + ifname + ")"))
+        raise SystemExit(1)
+    return state, answers
+
+
+def _render_init_preview(state, args):
+    """Dry-run preview shared by `init --dry-run` and the TUI first-run flow."""
+    emit(["", section("preview", args)])
+    emit(note(t("reload_dry_title"), "dryrun", args, indent=1))
+    print(redact_text(render_netdev(state, show_secrets=False), show_secrets=False))
+    print(render_network(state))
+    print(render_nft(state))
+    print(render_sysctl(state))
+    emit(hint("add --apply --yes --sudo to write these files.", args))
+
+
+def cmd_init(args):
+    # Guard: init is first-time-only; refuse when state exists unless --force.
+    if _is_initialized() and not getattr(args, "force", False):
+        eprint(t("err_already_init").format(path=str(state_path())))
+        raise SystemExit(1)
+    state, _answers = _collect_init_proposal(args)
+    tty = _stdin_isatty()
     if tty and not prompt_yesno("q_confirm"):
         emit(note(t("msg_dry_run"), "dryrun", args, indent=1))
         return 0
     can_write = require_apply(args, "init")
     if not can_write:
         # Show rendered output in dry-run mode only (dry-run preview uses redacted output).
-        emit(["", section("preview", args)])
-        emit(note(t("reload_dry_title"), "dryrun", args, indent=1))
-        print(redact_text(render_netdev(state, show_secrets=False), show_secrets=False))
-        print(render_network(state))
-        print(render_nft(state))
-        print(render_sysctl(state))
-        emit(hint("add --apply --yes --sudo to write these files.", args))
+        _render_init_preview(state, args)
         return 0
     # Refuse before saving state if the selected backend is not running.
-    _precheck_backend(backend)
+    _precheck_backend(state["server"]["backend"])
     # Audit fix: C1 - real key material only for privileged writes.
     import_path = getattr(args, "import_server_key", "") or ""
     if import_path:
@@ -416,7 +443,7 @@ def cmd_init(args):
             eprint(t("err_already_init").format(path=str(state_path())))
             raise SystemExit(1)
         try:
-            applied = apply_system_reload(state, backend, detect_firewall_default(), args)
+            applied = apply_system_reload(state, state["server"]["backend"], detect_firewall_default(), args)
         except OSError as exc:
             eprint(str(exc))
             raise SystemExit(1)
@@ -425,7 +452,7 @@ def cmd_init(args):
         # Persist only after a successful system apply: a failed apply must not
         # leave a state file claiming the server is configured.
         save_state(state)
-        audit("init", "endpoint=" + endpoint)
+        audit("init", "endpoint=" + str(state["server"].get("endpoint", "")))
     emit(["", section("result", args)])
     emit(note(t("msg_applied"), "applied", args, indent=1))
     emit(note(t("msg_init_done").format(path=str(state_path())), "ok", args, indent=1))
@@ -518,7 +545,7 @@ def cmd_add(args):
     # Audit fix: N9 - reject a default route from non-infra peers.
     validate_routes_for_role(routes, role)
     dns_scope = getattr(args, "dns_scope", "") or ""
-    dflt_dns = "tunnel" if (traffic == "full-tunnel" and (state.get("ipv4", {}).get("hub") or state.get("server", {}).get("dns"))) else "none"
+    dflt_dns = "none"
     if not dns_scope and sys.stdin.isatty():
         dns_scope = prompt_value(t("add_dns_prompt").format(default=dflt_dns), dflt_dns)
     dns_scope = dns_scope or dflt_dns
@@ -1222,12 +1249,14 @@ def cmd_purge(args):
         emit(note("count=" + str(len(tombstoned)), "info", args, indent=1))
         return 0
     purged_count = 0
+    purged_names = []
     with locked_state() as fresh:
 
         def _is_purgeable(peer):
             return bool(peer.get("tombstoned")) and peer.get("pool", "clients") == pool_name
 
         purged_count = sum(1 for p in fresh.get("peers", []) if _is_purgeable(p))
+        purged_names = [str(p.get("name", "")) for p in fresh.get("peers", []) if _is_purgeable(p)]
         fresh["peers"] = [p for p in fresh.get("peers", []) if not _is_purgeable(p)]
         try:
             applied = apply_system_reload(fresh, fresh.get("server", {}).get("backend", "networkd") or "networkd", detect_firewall_default(), args)
@@ -1240,6 +1269,18 @@ def cmd_purge(args):
         # leave a state file claiming the server is configured.
         save_state(fresh)
         audit("purge", "pool=" + pool_name)
+    for pname in purged_names:
+        try:
+            safe = validate_name(pname)
+        except ValueError:
+            continue
+        for suffix in (".conf", ".rsc", ".png"):
+            try:
+                artifact = state_dir() / "clients" / (safe + suffix)
+                if artifact.is_file() and not artifact.is_symlink():
+                    artifact.unlink()
+            except OSError:
+                pass
     emit(note(t("msg_purge_done").format(count=purged_count, pool=pool_name), "ok", args, indent=1))
     return 0
 
@@ -1259,6 +1300,9 @@ def cmd_reclaim(args):
     if peer is None:
         emit(note(t("err_peer_not_found").format(name=name), "err", args, indent=1), stream="err")
         raise SystemExit(1)
+    if not peer.get("tombstoned"):
+        emit(note(t("err_reclaim_not_tombstoned").format(name=name), "err", args, indent=1), stream="err")
+        raise SystemExit(1)
     pool_name = peer.get("pool", "clients")
     pool_v4 = find_pool(state, pool_name, 4)
     if pool_v4 is None:
@@ -1270,12 +1314,21 @@ def cmd_reclaim(args):
     if not fresh:
         eprint(exhaustion_message(pool_name, pool_v4["range"], state.get("peers", [])))
         raise SystemExit(1)
+    pool_v6 = find_pool(state, pool_name, 6)
+    hub6 = state.get("ipv6", {}).get("hub", "")
+    fresh6 = next_free_ip(pool_v6["range"], others, hub6) if pool_v6 is not None else ""
+    if state.get("ipv6", {}).get("mode", "disabled") != "disabled" and pool_v6 is not None and not fresh6:
+        eprint(exhaustion_message(pool_name, pool_v6["range"], state.get("peers", [])))
+        raise SystemExit(1)
     can_write = require_apply(args, "reclaim")
     if not can_write:
         emit(note("would-reclaim=" + fresh, "dryrun", args, indent=1))
         return 0
     with locked_state() as fresh_state:
         peer = _find_peer_or_exit(fresh_state, name, args)
+        if not peer.get("tombstoned"):
+            emit(note(t("err_reclaim_not_tombstoned").format(name=name), "err", args, indent=1), stream="err")
+            raise SystemExit(1)
         pool_name = peer.get("pool", "clients")
         pool_v4 = find_pool(fresh_state, pool_name, 4)
         if pool_v4 is None:
@@ -1288,6 +1341,16 @@ def cmd_reclaim(args):
             eprint(exhaustion_message(pool_name, pool_v4["range"], fresh_state.get("peers", [])))
             raise SystemExit(1)
         peer["v4"] = fresh
+        pool_v6 = find_pool(fresh_state, pool_name, 6)
+        if pool_v6 is not None:
+            hub6 = fresh_state.get("ipv6", {}).get("hub", "")
+            fresh6 = next_free_ip(pool_v6["range"], others, hub6)
+            if fresh_state.get("ipv6", {}).get("mode", "disabled") != "disabled" and not fresh6:
+                eprint(exhaustion_message(pool_name, pool_v6["range"], fresh_state.get("peers", [])))
+                raise SystemExit(1)
+            peer["v6"] = fresh6 or ""
+        elif fresh_state.get("ipv6", {}).get("mode", "disabled") == "disabled":
+            peer["v6"] = ""
         peer["tombstoned"] = False
         peer["enabled"] = True
         try:
@@ -1308,7 +1371,7 @@ def cmd_reclaim(args):
 def cmd_reload(args):
     state = load_state_or_default(args)
     backend = validate_backend(getattr(args, "backend", "") or state.get("server", {}).get("backend", "networkd"))
-    firewall = validate_firewall(getattr(args, "firewall", "") or detect_firewall_default())
+    firewall = validate_firewall(getattr(args, "firewall", "") or str(state.get("server", {}).get("firewall") or "") or detect_firewall_default())
     show_secrets = bool(getattr(args, "show_secrets", False))
     want_apply = bool(getattr(args, "apply", False))
     if not want_apply or getattr(args, "dry_run", False):
@@ -1594,6 +1657,32 @@ def cmd_check(args):
         results.append(("ok", t("check_iface_ok").format(iface=ifname)))
     else:
         results.append(("err", t("check_iface_missing").format(iface=ifname)))
+    # Expected-live-state preflight (warn-only, never fail offline hosts).
+    try:
+        link_kind = _link_kind(ifname) if iface_ok else None
+    except (OSError, ValueError):
+        link_kind = None
+    if link_kind is not None and link_kind != "wireguard":
+        results.append(("warn", t("check_link_foreign").format(iface=ifname, kind=link_kind)))
+    # State file hardening (warn-only; loading already succeeded or defaulted).
+    try:
+        sstat = Path(str(state_path())).stat()
+        smode = sstat.st_mode & 0o777
+        if smode != 0o600:
+            results.append(("warn", t("check_state_mode").format(path=str(state_path()), mode=oct(smode))))
+        try:
+            euid = os.geteuid()
+        except AttributeError:
+            euid = None
+        if euid == 0:
+            try:
+                owned_by_root = (sstat.st_uid == 0)
+            except AttributeError:
+                owned_by_root = True
+            if not owned_by_root:
+                results.append(("warn", t("check_state_owner").format(path=str(state_path()))))
+    except (OSError, ValueError):
+        pass
     # Service check.
     ctl = shutil.which("systemctl")
     if ctl:
@@ -1769,6 +1858,15 @@ def cmd_check(args):
             results.append(("warn", t("check_mtu_warn").format(wan_mtu=wan_mtu, wg_mtu=wg_mtu, rec_mtu=rec_mtu)))
         else:
             results.append(("ok", t("check_mtu_ok").format(wan_mtu=wan_mtu, wg_mtu=wg_mtu)))
+    try:
+        live_mtu = None
+        live_path = Path("/sys/class/net/" + str(ifname) + "/mtu")
+        if live_path.exists():
+            live_mtu = int(live_path.read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        live_mtu = None
+    if live_mtu is not None and live_mtu != wg_mtu:
+        results.append(("warn", t("check_mtu_warn").format(wan_mtu="live", wg_mtu=live_mtu, rec_mtu=wg_mtu)))
     # MSS clamping check in firewall
     mss_ok = False
     if nft_ok and nft_exe:
@@ -1794,9 +1892,12 @@ def cmd_check(args):
     # Handshake age (best-effort via wg show).
     wg_exe = shutil.which("wg")
     dump = {}
+    wg_ok = False
     if wg_exe:
         try:
             proc = subprocess.run([wg_exe, "show", ifname, "dump"], capture_output=True, text=True, timeout=5, check=False)
+            if proc.returncode == 0:
+                wg_ok = True
             for line in proc.stdout.splitlines()[1:]:
                 fields = line.split("\t")
                 if len(fields) >= 5:
@@ -1806,6 +1907,7 @@ def cmd_check(args):
                         pass
         except (OSError, subprocess.SubprocessError):
             dump = {}
+            wg_ok = False
     # Audit fix: A2 - flag peers that request DNS without configured servers.
     server_dns = srv.get("dns", [])
     if isinstance(server_dns, str):
@@ -1823,6 +1925,9 @@ def cmd_check(args):
         if exp and now > int(exp):
             exp_date = datetime.fromtimestamp(int(exp), tz=timezone.utc).strftime("%Y-%m-%d")
             results.append(("warn", t("check_peer_expired").format(name=peer.get("name", ""), date=exp_date)))
+        elif exp and int(exp) - now <= 7 * 86400:
+            exp_date = datetime.fromtimestamp(int(exp), tz=timezone.utc).strftime("%Y-%m-%d")
+            results.append(("warn", t("check_peer_expiring").format(name=peer.get("name", ""), date=exp_date)))
         if peer.get("dns_scope", "none") != "none" and not server_dns:
             results.append(("warn", t("check_dns_missing").format(name=peer.get("name", ""), scope=peer.get("dns_scope", "none"))))
         # Audit fix: A7 - skip handshake for peers without a valid public key.
@@ -1839,6 +1944,13 @@ def cmd_check(args):
                 results.append(("warn", t("check_handshake_stale").format(name=peer.get("name", ""), age=age)))
             else:
                 results.append(("ok", t("check_handshake_ok").format(name=peer.get("name", ""), age=age)))
+    # Expected-live-state: kernel peers should match configured active peers.
+    if wg_ok and iface_ok:
+        expected_keys = {str(p.get("pubkey", "")) for p in state.get("peers", [])
+                         if _is_active_peer(p) and is_valid_wgkey(p.get("pubkey", ""))}
+        live_keys = set(dump)
+        if live_keys != expected_keys:
+            results.append(("warn", t("check_peer_drift").format(live=len(live_keys), expected=len(expected_keys))))
     passed = sum(1 for r, _ in results if r == "ok")
     warned = sum(1 for r, _ in results if r == "warn")
     failed = sum(1 for r, _ in results if r == "err")
@@ -1887,7 +1999,11 @@ def cmd_backup(args):
         raise SystemExit(1)
     payload = json.dumps(state, indent=2, sort_keys=True, ensure_ascii=False) + "\n"
     atomic_write(dest, payload, mode=0o600)
-    _rotate_backups(dest.parent, "manual-*.json", 20)
+    try:
+        if dest.parent == state_dir() / "backups":
+            _rotate_backups(dest.parent, "manual-*.json", 20)
+    except (OSError, ValueError):
+        pass
     audit("backup", "dest=" + str(dest))
     emit(note(t("msg_backup_done").format(path=str(dest)), "ok", args, indent=1))
     return 0
@@ -1976,12 +2092,15 @@ def cmd_status(args):
         else:
             st = "never"
         hs_str = format_handshake_age(hs, now)
+        hs_age = (max(0, now - int(hs)) if hs else None)
         rows.append([name, ip, st, hs_str, traffic, ep])
         payload_peers.append({
             "name": name,
             "v4": ip,
             "status": st,
             "handshake_seconds": hs,
+            "handshake_timestamp": hs,
+            "handshake_age_seconds": hs_age,
             "rx_bytes": rx,
             "tx_bytes": tx,
             "endpoint": None if ep == "-" else ep,
@@ -2036,8 +2155,10 @@ def cmd_enable(args):
         return 0
     with locked_state() as fresh:
         fresh_peer = _find_peer_or_exit(fresh, name, args)
+        if fresh_peer.get("tombstoned"):
+            emit(note(t("err_peer_tombstoned").format(name=name), "err", args, indent=1), stream="err")
+            raise SystemExit(1)
         fresh_peer["enabled"] = True
-        fresh_peer["tombstoned"] = False
         try:
             applied = apply_system_reload(fresh, fresh.get("server", {}).get("backend", "networkd") or "networkd", detect_firewall_default(), args)
         except OSError as exc:
@@ -2086,6 +2207,46 @@ def cmd_disable(args):
     return 0
 
 
+def cmd_sweep(args):
+    """Disable expired peers (expiry enforcement for the daily timer/cron).
+
+    Expired peers are already excluded from every rendered configuration;
+    sweep additionally flips their stored `enabled` flag so state, status
+    and future renders agree. No-op when nothing is expired.
+    """
+    state = load_state()
+    targets = [p.get("name", "") for p in state.get("peers", [])
+               if p.get("enabled", True) and not p.get("tombstoned") and _peer_is_expired(p)]
+    targets = [name for name in targets if name]
+    if not targets:
+        emit(note(t("msg_sweep_nothing"), "ok", args, indent=1))
+        return 0
+    if not require_apply(args, "sweep"):
+        emit(note("would-sweep=" + ",".join(sorted(targets)), "dryrun", args, indent=1))
+        return 0
+    with locked_state() as fresh:
+        swept = []
+        for item in fresh.get("peers", []):
+            if item.get("enabled", True) and not item.get("tombstoned") and _peer_is_expired(item):
+                item["enabled"] = False
+                swept.append(item.get("name", ""))
+        if not swept:
+            emit(note(t("msg_sweep_nothing"), "ok", args, indent=1))
+            return 0
+        validate_key_material(fresh)
+        try:
+            applied = apply_system_reload(fresh, fresh.get("server", {}).get("backend", "networkd") or "networkd", detect_firewall_default(), args)
+        except OSError as exc:
+            eprint(t("err_apply_failed").format(reason=str(exc)))
+            raise SystemExit(1)
+        if not applied:
+            raise SystemExit(1)
+        save_state(fresh)
+        audit("sweep", "names=" + ",".join(sorted(swept)))
+    emit(note(t("msg_sweep_done").format(count=len(swept)), "applied", args, indent=1))
+    return 0
+
+
 def cmd_export(args):
     state = load_state()
     name = getattr(args, "name", "") or ""
@@ -2102,7 +2263,8 @@ def cmd_export(args):
             emit(note(t("err_peer_not_found").format(name=name), "err", args, indent=1), stream="err")
             raise SystemExit(1)
     else:
-        target_peers = [p for p in peers if p.get("role", "client") != "infra" and not p.get("tombstoned")]
+        from .renderers import _peer_is_expired as _exp
+        target_peers = [p for p in peers if p.get("role", "client") != "infra" and not p.get("tombstoned") and p.get("enabled", True) and not _exp(p)]
     if not target_peers:
         emit(note(t("list_empty"), "info", args, indent=1))
         return 0
@@ -2116,6 +2278,7 @@ def cmd_export(args):
         eprint(str(exc))
         raise SystemExit(1)
     count = 0
+    exported_names = set()
     for peer in target_peers:
         # Audit: never trust state-derived names for filesystem paths.
         peer_name = validate_name(peer.get("name", ""))
@@ -2123,7 +2286,20 @@ def cmd_export(args):
         # atomic_write uses an O_EXCL|O_NOFOLLOW temp plus os.replace, so a
         # pre-existing symlink is replaced instead of followed.
         atomic_write(out_path / (peer_name + ".conf"), conf_text, mode=0o600)
+        exported_names.add(peer.get("name", ""))
         count += 1
+    if exported_names:
+        try:
+            with locked_state() as fresh:
+                changed = False
+                for item in fresh.get("peers", []):
+                    if item.get("name") in exported_names and item.get("needs_reissue"):
+                        item["needs_reissue"] = False
+                        changed = True
+                if changed:
+                    save_state(fresh)
+        except (OSError, ValueError):
+            pass
     emit(note(t("msg_exported").format(count=count, path=str(out_path)), "ok", args, indent=1))
     return 0
 
@@ -2160,7 +2336,9 @@ def cmd_uninstall(args):
         return 0
 
     apply_system_uninstall(state, args)
-    remove_state_data()
+    if not remove_state_data():
+        eprint(t("err_apply_failed").format(reason="state cleanup incomplete"))
+        return 1
 
     emit(banner(t("uninstall_title"), [("mode", "APPLIED")], args))
     emit(["", note(t("uninstall_done"), "applied", args, indent=1),

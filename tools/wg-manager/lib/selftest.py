@@ -398,8 +398,58 @@ def cmd_self_test(_args=None):
         red = redact_text('x PrivateKey = ABC\n{"privkey": "SECRET"}')
         if "ABC" in red or "SECRET" in red:
             fail("redact_text leaked secret")
+        # Default policy is accept-only: the tool must never render a drop
+        # verdict itself (sink use-case); drops belong to the operator.
+        if "policy drop" in nft_out or "policy drop" in render_nft(st):
+            fail("rendered nft contains a default drop policy")
     except (ValueError, KeyError) as exc:
         fail("key/render/nft checks raised: " + str(exc))
+    # 16. Init collector round-trip: replaying collected answers via --set
+    # must reproduce the identical proposal (TUI single-pass fidelity).
+    try:
+        from . import commands as _cmdmod
+        from .commands import _collect_init_proposal
+        _saved_isatty = _cmdmod._stdin_isatty
+        _saved_overlap = _cmdmod.check_wan_overlap
+        _saved_onlink = _cmdmod.check_wan_v6_onlink
+        _cmdmod._stdin_isatty = lambda: False
+        # Deterministic offline: host routes vary per machine, pure fixtures
+        # for overlap guards already covered in section 8.
+        _cmdmod.check_wan_overlap = lambda *a, **k: None
+        _cmdmod.check_wan_v6_onlink = lambda *a, **k: None
+        try:
+            seed_sets = [
+                "endpoint=vpn.example.com", "port=51820", "mtu=1420",
+                "ifname=wg0", "backend=networkd", "wan_iface=eth0",
+                "ipv4_prefix=10.90.90.0/24", "ipv4_hub=10.90.90.1",
+                "ipv6_mode=ula", "ipv6_prefix=fd90:90:90::/64",
+                "ipv6_hub=fd90:90:90::1", "ipv6_wan=",
+                "dns=1.1.1.1, 8.8.8.8", "permanent=yes",
+                "infra=10-20", "clients=21-150",
+                "clients_v6=21-150",
+            ]
+            first_args = argparse.Namespace(set=list(seed_sets), apply=False, yes=False,
+                                            sudo=False, dry_run=True, show_secrets=False)
+            state1, answers1 = _collect_init_proposal(first_args)
+            replay_sets = [k + "=" + v for k, v in answers1.items()]
+            second_args = argparse.Namespace(set=replay_sets, apply=False, yes=False,
+                                             sudo=False, dry_run=True, show_secrets=False)
+            state2, _answers2 = _collect_init_proposal(second_args)
+            if json.dumps(state1, sort_keys=True) != json.dumps(state2, sort_keys=True):
+                fail("init collector replay diverged")
+            if set(answers1) != {"endpoint", "port", "mtu", "ifname", "backend", "wan_iface",
+                                 "ipv4_prefix", "ipv4_hub", "ipv6_mode", "ipv6_prefix",
+                                 "ipv6_hub", "ipv6_wan", "dns", "permanent",
+                                 "infra", "clients", "clients_v6"}:
+                fail("init collector answers incomplete: " + str(sorted(answers1)))
+        finally:
+            _cmdmod._stdin_isatty = _saved_isatty
+            _cmdmod.check_wan_overlap = _saved_overlap
+            _cmdmod.check_wan_v6_onlink = _saved_onlink
+    except SystemExit as exc:
+        fail("init collector raised SystemExit: " + str(exc.code))
+    except (ValueError, KeyError) as exc:
+        fail("init collector raised: " + str(exc))
     if failures:
         for item in failures:
             eprint(t("selftest_fail").format(detail=item))

@@ -2,7 +2,7 @@
 
 > Guided native WireGuard server manager for Debian, RHEL, Fedora and Arch operators.
 
-Owner: `@balakar94` | Last-verified: `2026-09-19` | Status: `incubating` | License: `Apache-2.0`
+Owner: `@balakar94` | Last-verified: `2026-09-24` | Status: `incubating` | License: `Apache-2.0`
 
 ## Use for
 
@@ -120,6 +120,7 @@ over `--apply`. `list`, `check`, and `status` accept `--json`.
   ```
 
 - `enable` / `disable`: Temporarily pause or re-activate a peer without releasing its assigned address.
+  `enable` refuses tombstoned peers (use `reclaim`); `disable` never releases the address.
 
   ```bash
   wg-manager disable phone
@@ -133,17 +134,28 @@ over `--apply`. `list`, `check`, and `status` accept `--json`.
   wg-manager delete phone
   ```
 
-- `reclaim`: Release a tombstoned peer's reserved IP address back into the free IP pool.
+- `reclaim`: Restore a tombstoned peer with a fresh IPv4 (and IPv6 when the pool exists).
+  Refuses peers that are not tombstoned.
 
   ```bash
   wg-manager reclaim phone
   ```
 
 - `purge`: Permanently delete tombstoned peers from the state file and free their addresses.
+  Also removes their generated `.conf`/`.rsc`/`.png` artifacts under the state `clients/` directory.
   - Flags: `--pool <name>` (optional pool filter).
 
   ```bash
   wg-manager purge
+  ```
+
+- `sweep`: Disable expired peers so state, status and renders agree (expired peers are already
+  excluded from every WireGuard configuration). A daily systemd timer (`wg-manager-expire.timer`,
+  installed automatically while any peer carries an expiry date) runs it; safe to run manually.
+
+  ```bash
+  wg-manager sweep --dry-run
+  wg-manager sweep --apply --yes --sudo
   ```
 
 ### Client Configuration & QR
@@ -177,7 +189,8 @@ over `--apply`. `list`, `check`, and `status` accept `--json`.
 
 - `status`: Query the live WireGuard interface (`wg show <ifname> dump`) for handshake age, transfer
   counters, and active endpoints. `--json` prints `interface`, `interface_present`, `peers[]` (`name`,
-  `v4`, `status`, `handshake_seconds`, `rx_bytes`, `tx_bytes`, `endpoint`, `enabled`, `tombstoned`),
+  `v4`, `status`, `handshake_seconds` (epoch, kept for compatibility), `handshake_timestamp`,
+  `handshake_age_seconds` (`null` when never), `rx_bytes`, `tx_bytes`, `endpoint`, `enabled`, `tombstoned`),
   `online`, and `total`.
 
   ```bash
@@ -198,8 +211,10 @@ over `--apply`. `list`, `check`, and `status` accept `--json`.
 
 - `check`: Run health checks: Curve25519 key shapes, IPv4 forwarding sysctl
   (`net.ipv4.ip_forward=1`), backend daemon status, the active firewall engine (tagged nftables rules
-  and drop policies, firewalld `trusted` zone, ufw port/routing), MTU/MSS clamping, and handshake age.
-  Disabled peers are skipped, so they never raise false handshake warnings.
+  and drop policies, firewalld `trusted` zone, ufw port/routing), MTU/MSS clamping (configured and
+  live), handshake age, peers expiring within 7 days, live-vs-configured peer drift, link kind, and
+  state file mode/ownership. Disabled peers are skipped, so they never raise false handshake warnings.
+  Extra checks are warn-only: `check` exits `1` only when a check reports `err`, `0` otherwise.
   - `--json` prints `results[].status|message` (`ok`, `warn`, `err`, `skip`) plus `passed`, `warnings`,
     `failed`, `skipped`. Exits `1` when any check reports `err`, `0` otherwise.
 
@@ -236,8 +251,10 @@ over `--apply`. `list`, `check`, and `status` accept `--json`.
   ```
 
 - `uninstall` / `--uninstall`: Remove the WireGuard interface, network units, sysctl file, firewall
-  rules, and the state directory (`/etc/wg-manager`), resetting the host for a fresh start. Restores
-  the sysctl values captured at first apply and removes firewalld masquerade and rich rules. Does not
+  rules, and the manager-owned state files, resetting the host for a fresh start. Restores
+  the sysctl values captured at first apply and removes firewalld rich rules (never a global
+  masquerade). Only a state directory carrying the manager marker is removed recursively;
+  otherwise only known files are deleted. Does not
   remove the `wg-manager` binary itself.
   - Flags: `--dry-run`, `--apply --yes [--sudo]`.
 
@@ -268,14 +285,20 @@ over `--apply`. `list`, `check`, and `status` accept `--json`.
 `wg-manager` complements host network configurations without overwriting them:
 
 - **`nftables` (Debian, Ubuntu, Arch)**: manages isolated tables `inet wg_manager`, `ip wg_manager_nat4`,
-  and `ip6 wg_manager_nat6`, scopes NAT masquerade to non-WireGuard egress (`oifname != <ifname>`), and
+  and `ip6 wg_manager_nat6`, scopes NAT masquerade to the configured WAN egress (`oifname "<wan>"`), and
   inserts tagged rules (`comment "wg-manager"`) into the host filter table so a host `policy drop` keeps
   working; uninstall removes only tagged rules. MSS is clamped dynamically with
   `tcp flags syn tcp option maxseg size set rt mtu`.
 - **`firewalld` (RHEL, Fedora, CentOS, AlmaLinux, Rocky)**: assigns the interface to the `trusted` zone,
-  resolving inter-zone forwarding drops introduced in firewalld >= 0.9.0, opens the UDP port, enables
-  masquerade, and clamps MSS via `--clamp-mss-to-pmtu`. Uninstall removes interface, port, masquerade,
+  resolving inter-zone forwarding drops introduced in firewalld >= 0.9.0, opens the UDP port in that
+  zone, uses source-scoped rich-rule masquerade (no global masquerade), and clamps MSS via
+  `--clamp-mss-to-pmtu`. Uninstall removes interface, port,
   rich rules, and direct MSS rules.
+- **Policy note (sink use-case)**: the default rules only ever *accept* tunnel traffic; the tool
+  never renders a `drop` verdict itself. This is intentional: on a traffic sink the tunnel must
+  keep flowing even while external lists block addresses elsewhere (e.g. football blackouts).
+  To restrict peer destinations, add your own nftables/firewalld rules and adjust the tagged
+  `wg-manager` accepts — the tool will not add default-deny on your behalf.
 - **`ufw` (Ubuntu, Debian)**: when active, allows the UDP port and routed forwarding
   (`ufw route allow in on <ifname>`); both rules are deleted on uninstall.
 - **MTU mechanics**: IPoE uplinks default to WireGuard MTU 1420; PPPoE (uplink MTU 1492) needs 1412.
@@ -328,8 +351,12 @@ RHEL-family hosts may need EPEL for `wireguard-tools`.
 
 - State contains server and peer private keys: `state.json` is `0600` inside a `0700` directory, and
   the rotating backups (`state-*`, `sys-*`, `manual-*`, kept to 20 each) carry the same sensitivity.
+  `check` warns when the state file mode or root ownership drifts.
 - `--show-secrets` prints private and pre-shared keys to stdout; treat that output as sensitive.
-- The state file is not encrypted at rest (roadmap item).
+- Backups are deliberately **not encrypted**: encryption would just move the secret to a key file
+  on the same host (same threat model as the `0600` files), while a lost external key would make
+  disaster recovery impossible. If you need it, wrap `<state_dir>/backups` with LUKS/host-level
+  encryption; a future `age`-based opt-in needs an external KMS/TPM design first.
 
 ## Limits & status
 

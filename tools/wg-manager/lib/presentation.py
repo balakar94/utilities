@@ -243,7 +243,7 @@ def emit(lines, stream="out"):
 
 
 def usage():
-    return "Usage: wg-manager [--lang auto|en|es|de] [--color always|auto|never] [--no-color] [--width N] [--version] [--self-test] [--uninstall]\n       wg-manager <init|add|edit|delete|list|show|qr|purge|reclaim|reconfigure|reload|check|backup|rollback|menu|status|enable|disable|export|uninstall> [options]\n\nWireGuard native server manager. Dry-run by default; system writes need --apply --yes --sudo.\n"
+    return "Usage: wg-manager [--lang auto|en|es|de] [--color always|auto|never] [--no-color] [--width N] [--version] [--self-test] [--uninstall]\n       wg-manager <init|add|edit|delete|list|show|qr|purge|reclaim|reconfigure|reload|check|backup|rollback|menu|status|enable|disable|export|sweep|uninstall> [options]\n\nWireGuard native server manager. Dry-run by default; system writes need --apply --yes --sudo.\n"
 
 
 

@@ -61,6 +61,7 @@ def seed_state(path, **overrides):
         "peers": [],
     }
     data.update(overrides)
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
     Path(path).write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     return data
 
@@ -319,7 +320,8 @@ def main():
                 ("disable", ["disable", "phone", "--dry-run"]),
                 ("delete", ["delete", "phone", "--dry-run"]),
                 ("purge", ["purge", "--dry-run"]),
-                ("reclaim", ["reclaim", "phone", "--dry-run"]),
+                ("reclaim", ["reclaim", "dead", "--dry-run"]),
+                ("sweep", ["sweep", "--dry-run"]),
                 ("rollback-list", ["rollback", "--list"]),
             ):
                 p = run(argv, env=env, cwd=tmp)
@@ -480,7 +482,9 @@ def main():
                 _system_mod.shutil.which = _saved_which
 
             # Sandboxed apply: init --apply writes the full file set.
-            init_state = Path(tmp) / "init-state.json"
+            # The state lives in a dedicated subdirectory so uninstall only
+            # removes manager-owned files, never the shared tmp fixtures.
+            init_state = Path(tmp) / "statedir" / "state.json"
             init_env = fake_env(tmp, bindir, init_state, sysroot)
             init_apply = run([
                 "init", "--apply", "--yes",
@@ -550,6 +554,28 @@ def main():
             rec("reclaim clears tombstone", tablet.get("tombstoned") is False, "still tombstoned")
             rec("reclaim exits 0", rcl.returncode == 0, f"rc={rcl.returncode}")
 
+            # sweep disables expired peers and installs the expiry timer units.
+            st = json.loads(init_state.read_text(encoding="utf-8"))
+            for p in st["peers"]:
+                if p["name"] == "tablet":
+                    p["expires_at"] = 1700000000
+            init_state.write_text(json.dumps(st), encoding="utf-8")
+            sw_before = init_state.read_bytes()
+            sw_dry = run(["sweep", "--dry-run"], env=init_env, cwd=tmp)
+            rec("sweep dry-run exits 0", sw_dry.returncode == 0, f"rc={sw_dry.returncode}")
+            rec("sweep dry-run previews tablet", "tablet" in (sw_dry.stdout + sw_dry.stderr), "no tablet in preview")
+            rec("sweep dry-run writes nothing", init_state.read_bytes() == sw_before, "state changed")
+            sw = run(["sweep", "--apply", "--yes"], env=init_env, cwd=tmp)
+            rec("sweep --apply exits 0", sw.returncode == 0, f"rc={sw.returncode} err={(sw.stdout + sw.stderr)[-200:]}")
+            st = json.loads(init_state.read_text(encoding="utf-8"))
+            tablet = next(p for p in st["peers"] if p["name"] == "tablet")
+            rec("sweep disables expired", tablet.get("enabled") is False, "still enabled")
+            sw_svc = sysroot / "etc" / "systemd" / "system" / "wg-manager-expire.service"
+            sw_tmr = sysroot / "etc" / "systemd" / "system" / "wg-manager-expire.timer"
+            rec("sweep installs timer units", sw_svc.exists() and sw_tmr.exists(), "timer units missing")
+            sw_nothing = run(["sweep", "--apply", "--yes"], env=init_env, cwd=tmp)
+            rec("sweep no-op exits 0", sw_nothing.returncode == 0, f"rc={sw_nothing.returncode}")
+
             # backup --apply writes manual-* and rollback --list sees it.
             b1 = run(["backup", "--apply", "--yes"], env=init_env, cwd=tmp)
             backups = sorted((init_state.parent / "backups").glob("manual-*.json"))
@@ -609,15 +635,26 @@ def main():
             rec("uninstall removes network", not network.exists(), "network still exists")
             rec("uninstall removes sysctl", not sysctl_conf.exists(), "sysctl still exists")
             rec("uninstall removes nft", not nft_file.exists(), "nft still exists")
+            rec("uninstall removes sweep timer", not (sysroot / "etc" / "systemd" / "system" / "wg-manager-expire.timer").exists(), "timer still exists")
+            rec("uninstall removes sweep service", not (sysroot / "etc" / "systemd" / "system" / "wg-manager-expire.service").exists(), "service still exists")
             rec("uninstall removes state dir", not init_state.parent.exists(), "state dir still exists")
             rec("main.py is preserved", ENTRY.exists(), "ENTRY missing")
             fw_log = flog.read_text(encoding="utf-8") if flog.exists() else ""
-            rec("uninstall removes firewalld masquerade", "remove-masquerade" in fw_log or True, "n/a")
+            rec("uninstall removes firewalld rules", "remove-interface" in fw_log and "remove-rich-rule" in fw_log, fw_log[-200:] if fw_log else "n/a")
 
         # ---------------------------------------------------------------- L4
-        raw = ENTRY.read_bytes()
-        bad = sum(1 for b in raw if b > 127)
-        rec("source is ASCII-only", bad == 0, f"{bad} non-ascii bytes")
+        bad = 0
+        bad_files = []
+        for src in [ENTRY, *(TOOL_ROOT / "lib").glob("*.py")]:
+            try:
+                raw = src.read_bytes()
+            except OSError:
+                continue
+            non_ascii = sum(1 for b in raw if b > 127)
+            bad += non_ascii
+            if non_ascii:
+                bad_files.append(src.name)
+        rec("source is ASCII-only", bad == 0, f"{bad} non-ascii bytes in {','.join(bad_files)}" if bad else "0 non-ascii bytes")
 
         with tempfile.TemporaryDirectory() as tmp:
             state = str(Path(tmp) / "state.json")

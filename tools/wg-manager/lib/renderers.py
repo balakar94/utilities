@@ -7,7 +7,27 @@ import subprocess
 from .crypto import _server_privkey, _server_pubkey, is_valid_wgkey
 from .i18n import t
 from .ipam import peers_sorted
-from .validators import validate_ifname
+from .validators import validate_endpoint, validate_ifname
+
+
+def _peer_is_expired(peer):
+    exp = peer.get("expires_at")
+    if exp is None:
+        return False
+    try:
+        from datetime import datetime, timezone
+        now = int(datetime.now(timezone.utc).timestamp())
+        return now > int(exp)
+    except (ValueError, TypeError):
+        return False
+
+
+def _is_active_peer(peer):
+    if peer.get("tombstoned"):
+        return False
+    if not peer.get("enabled", True):
+        return False
+    return not _peer_is_expired(peer)
 
 
 def _run_capture(cmd, input_text=None, timeout=10):
@@ -91,9 +111,7 @@ def render_netdev(state, show_secrets=False):
         "",
     ]
     for peer in peers_sorted(state.get("peers", [])):
-        if not peer.get("enabled", True):
-            continue
-        if peer.get("tombstoned"):
+        if not _is_active_peer(peer):
             continue
         if not peer.get("pubkey"):
             continue
@@ -170,6 +188,18 @@ def render_network(state):
         if v6prefix and mode != "disabled":
             lines.append("IPv6Forwarding=yes")
     lines.append("")
+    # Hub FIB routes for site-to-site peers: AllowedIPs alone is not an OS route.
+    for peer in peers_sorted(state.get("peers", [])):
+        if not _is_active_peer(peer):
+            continue
+        routes = peer.get("custom_routes", []) or []
+        if not routes:
+            continue
+        gw = (peer.get("v4") or "").split("/")[0].strip()
+        if not gw:
+            continue
+        for route in routes:
+            lines.extend(["", "[Route]", "Destination=" + str(route), "Gateway=" + gw])
     return "\n".join(lines)
 
 
@@ -194,6 +224,7 @@ def render_nm(state, show_secrets=False):
         "[wireguard]",
         "private-key=" + str(priv if priv else "REDACTED"),
         "listen-port=" + str(srv.get("port", 51820)),
+        "mtu=" + str(srv.get("mtu", 1420)),
         "",
         "[ipv4]",
         "method=manual",
@@ -202,6 +233,18 @@ def render_nm(state, show_secrets=False):
     v4hub = (state.get("ipv4", {}).get("hub") or "").strip()
     if v4prefix:
         lines.append("address1=" + _hub_with_len(v4hub, v4prefix))
+    # Hub FIB routes for NetworkManager (additive; empty when no custom routes).
+    _nm_routes = []
+    for _peer in peers_sorted(state.get("peers", [])):
+        if not _is_active_peer(_peer):
+            continue
+        _gw = (_peer.get("v4") or "").split("/")[0].strip()
+        if not _gw:
+            continue
+        for _route in _peer.get("custom_routes", []) or []:
+            _nm_routes.append(str(_route) + ";" + _gw + ";")
+    if _nm_routes:
+        lines.append("routes=" + ";".join(_nm_routes))
     mode = state.get("ipv6", {}).get("mode", "disabled")
     v6prefix = (state.get("ipv6", {}).get("prefix") or "").strip()
     v6hub = (state.get("ipv6", {}).get("hub") or "").strip()
@@ -209,7 +252,7 @@ def render_nm(state, show_secrets=False):
     if v6prefix and mode != "disabled":
         lines.append("address1=" + _hub_with_len(v6hub, v6prefix))
     for peer in peers_sorted(state.get("peers", [])):
-        if not peer.get("enabled", True) or peer.get("tombstoned") or not peer.get("pubkey"):
+        if not _is_active_peer(peer) or not peer.get("pubkey"):
             continue
         if show_secrets and not is_valid_wgkey(peer.get("pubkey", "")):
             raise ValueError(t("err_invalid_wgkey").format(path="peer " + str(peer.get("name", "?"))))
@@ -286,9 +329,9 @@ def render_nft(state):
             "    type nat hook postrouting priority srcnat; policy accept;",
         ])
         if has_nat4:
-            lines.append('    ip saddr ' + str(v4prefix) + ' oifname != "' + str(ifname) + '" masquerade')
+            lines.append('    ip saddr ' + str(v4prefix) + ' oifname "' + str(wan) + '" masquerade comment "wg-manager"')
         if has_nat6:
-            lines.append('    ip6 saddr ' + str(v6prefix) + ' oifname != "' + str(ifname) + '" masquerade')
+            lines.append('    ip6 saddr ' + str(v6prefix) + ' oifname "' + str(wan) + '" masquerade comment "wg-manager"')
         lines.append("  }")
     lines.extend([
         "}",
@@ -306,8 +349,7 @@ def firewalld_argv(state):
     v6prefix = (state.get("ipv6", {}).get("prefix") or "").strip()
     out = [
         ["firewall-cmd", "--permanent", "--zone=trusted", "--add-interface=" + str(ifname)],
-        ["firewall-cmd", "--permanent", "--add-port=" + str(port) + "/udp"],
-        ["firewall-cmd", "--permanent", "--add-masquerade"],
+        ["firewall-cmd", "--permanent", "--zone=trusted", "--add-port=" + str(port) + "/udp"],
     ]
     if v4prefix:
         out.append(["firewall-cmd", "--permanent", "--add-rich-rule", 'rule family="ipv4" source address="' + str(v4prefix) + '" masquerade'])
@@ -323,6 +365,34 @@ def firewalld_argv(state):
 def render_firewalld(state):
     """Render firewalld commands as printable strings (pure, from firewalld_argv)."""
     return [" ".join(argv) for argv in firewalld_argv(state)]
+
+
+def render_expire_service(exe):
+    """Pure systemd service renderer for the daily expiry sweep."""
+    return (
+        "# Managed by wg-manager. Do not edit manually.\n"
+        "[Unit]\n"
+        "Description=wg-manager expiry sweep (disable expired peers)\n"
+        "After=network-online.target\n"
+        "[Service]\n"
+        "Type=oneshot\n"
+        "ExecStart=" + str(exe) + " sweep --apply --yes\n"
+    )
+
+
+def render_expire_timer():
+    """Pure systemd timer renderer for the daily expiry sweep."""
+    return (
+        "# Managed by wg-manager. Do not edit manually.\n"
+        "[Unit]\n"
+        "Description=Daily wg-manager expiry sweep\n"
+        "[Timer]\n"
+        "OnCalendar=daily\n"
+        "RandomizedDelaySec=1h\n"
+        "Persistent=true\n"
+        "[Install]\n"
+        "WantedBy=timers.target\n"
+    )
 
 
 def render_sysctl(state):
@@ -371,8 +441,11 @@ def render_rsc(state, peer, show_secrets=True):
     """Pure MikroTik RouterOS renderer for one peer."""
     srv = state.get("server", {})
     ifname = srv.get("ifname", "wg0")
+    validate_ifname(ifname)
     mtu = srv.get("mtu", 1420)
     endpoint = srv.get("endpoint", "")
+    if endpoint:
+        validate_endpoint(endpoint)
     port = srv.get("port", 51820)
     server_pub = _server_pubkey(state)
     mode = state.get("ipv6", {}).get("mode", "disabled")
@@ -423,6 +496,8 @@ def render_rsc(state, peer, show_secrets=True):
         lines.append('/ip route add dst-address="' + v4prefix + '" gateway="' + str(ifname) + '"')
     if v6prefix and mode not in ("disabled", "ula"):
         lines.append('/ipv6 route add dst-address="' + v6prefix + '" gateway="' + str(ifname) + '"')
+    for route in peer.get("custom_routes", []) or []:
+        lines.append('/ip route add dst-address="' + str(route) + '" gateway="' + str(ifname) + '"')
     # Full-tunnel guard: keep endpoint reachable via WAN gateway.
     if peer.get("traffic") == "full-tunnel" and endpoint:
         wan_gw = srv.get("wan_gw", "")
@@ -447,6 +522,8 @@ def render_router_conf(state, peer, show_secrets=True):
     """Universal WireGuard configuration for a remote router or server peer (OpenWrt, Linux, VyOS, pfSense)."""
     srv = state.get("server", {})
     endpoint = srv.get("endpoint", "")
+    if endpoint:
+        validate_endpoint(endpoint)
     port = srv.get("port", 51820)
     server_pub = _server_pubkey(state)
     addrs = []
@@ -493,6 +570,10 @@ def render_router_conf(state, peer, show_secrets=True):
         ka_n = 0
     if ka_n:
         lines.append("PersistentKeepalive = " + str(ka_n))
+    for route in peer.get("custom_routes", []) or []:
+        lines.append("# Route via wg interface: " + str(route))
+    if peer.get("traffic") == "full-tunnel" and endpoint:
+        lines.append("# IMPORTANT full-tunnel: add host route for the endpoint via the WAN gateway or the wg UDP flow enters the tunnel.")
     return "\n".join(lines) + "\n"
 
 
@@ -500,6 +581,8 @@ def render_wgquick(state, peer, show_secrets=False):
     """Pure wg-quick renderer used for QR and text fallback."""
     srv = state.get("server", {})
     endpoint = srv.get("endpoint", "")
+    if endpoint:
+        validate_endpoint(endpoint)
     port = srv.get("port", 51820)
     server_pub = _server_pubkey(state)
     priv = peer.get("privkey", "") or peer.get("private_key", "")
@@ -521,15 +604,15 @@ def render_wgquick(state, peer, show_secrets=False):
     dns_scope = peer.get("dns_scope", "none")
     # Audit fix: A2 - tunnel scope uses the hub, all scope uses configured servers.
     dns_note = "wg-manager"
+    hub4 = (state.get("ipv4", {}).get("hub") or "").strip()
     if dns_scope == "tunnel":
-        hub4 = (state.get("ipv4", {}).get("hub") or "").strip()
         dns_list = srv.get("dns", [])
         if isinstance(dns_list, str):
             dns_list = [d for d in dns_list.split(",") if d.strip()]
-        if hub4:
-            lines.append("DNS = " + hub4 + "  # " + dns_note)
-        elif dns_list:
+        if dns_list:
             lines.append("DNS = " + ", ".join(str(d) for d in dns_list) + "  # " + dns_note)
+        elif hub4:
+            lines.append("DNS = " + hub4 + "  # " + dns_note + " (no hub resolver deployed)")
     elif dns_scope == "all":
         dns_list = srv.get("dns", [])
         if isinstance(dns_list, str):
@@ -555,6 +638,8 @@ def render_wgquick(state, peer, show_secrets=False):
         ka_n = 0
     if ka_n:
         lines.append("PersistentKeepalive = " + str(ka_n))
+    if peer.get("traffic") == "full-tunnel" and endpoint:
+        lines.append("# IMPORTANT full-tunnel: add host route for the endpoint via the WAN gateway or the wg UDP flow enters the tunnel.")
     return "\n".join(lines) + "\n"
 
 
@@ -585,7 +670,7 @@ def render_wg_syncconf(state, show_secrets=True):
     if priv and is_valid_wgkey(priv) and show_secrets:
         lines.append("PrivateKey = " + str(priv))
     for peer in peers_sorted(state.get("peers", [])):
-        if not peer.get("enabled", True) or peer.get("tombstoned") or not peer.get("pubkey"):
+        if not _is_active_peer(peer) or not peer.get("pubkey"):
             continue
         pk = str(peer.get("pubkey", ""))
         if not is_valid_wgkey(pk):

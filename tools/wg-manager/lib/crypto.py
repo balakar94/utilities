@@ -15,7 +15,7 @@ def _server_privkey(state): return (state.get("server", {}) or {}).get("private_
 # ---------------------------------------------------------------- wireguard keys
 def is_valid_wgkey(value):
     """Audit fix: C1 - base64 WireGuard key shape (43 chars + '=')."""
-    return isinstance(value, str) and bool(WGKEY_RE.match(value))
+    return isinstance(value, str) and bool(WGKEY_RE.fullmatch(value))
 
 
 def _wg_bin():
@@ -78,6 +78,14 @@ def validate_key_material(state):
     for peer in state.get("peers", []):
         if peer.get("tombstoned") or not peer.get("enabled", True):
             continue
+        exp = peer.get("expires_at")
+        if exp is not None:
+            try:
+                from datetime import datetime, timezone
+                if int(datetime.now(timezone.utc).timestamp()) > int(exp):
+                    continue
+            except (ValueError, TypeError):
+                pass
         pk = peer.get("pubkey", "")
         if not pk or not is_valid_wgkey(pk):
             raise ValueError(t("err_invalid_wgkey").format(path="peer " + str(peer.get("name", "?"))))

@@ -6,7 +6,9 @@ import time
 from pathlib import Path
 
 from .commands import (
+    _collect_init_proposal,
     _peer_state,
+    _render_init_preview,
     cmd_add,
     cmd_backup,
     cmd_check,
@@ -28,7 +30,7 @@ from .commands import (
     cmd_uninstall,
 )
 from .constants import C_ERR, C_OK, DEFAULT_STATE_PATH, PROG, VERSION
-from .i18n import current_lang, is_yes, t
+from .i18n import current_lang, t
 from .ipam import peers_sorted
 from .presentation import (
     banner,
@@ -815,7 +817,10 @@ def _print_help_screen(args, apply_mode=None):
 
 
 def _menu_first_run(args):
-    """Guided first-run flow: dry-run plan first, write only after explicit confirmation.
+    """Guided first-run flow: ask once, preview, write only after confirmation.
+
+    The questionnaire runs a single time; the confirmed answers are replayed
+    non-interactively for the apply, so preview and applied values match.
 
     Returns None to continue into the menu, or an exit code to abort.
     """
@@ -826,29 +831,21 @@ def _menu_first_run(args):
     print(paint("      " + t("first_run_prompt_help"), "value", args) + "\n")
     init_args = _menu_call_args(args, apply_mode=False)
     try:
-        res = cmd_init(init_args)
-        if res not in (0, None):
-            return int(res or 1)
+        state, answers = _collect_init_proposal(init_args)
     except SystemExit as exc:
         if exc.code not in (0, None):
             return int(exc.code or 1)
-    except KeyboardInterrupt:
-        eprint(t("interrupted"))
-        return 130
-    print(paint("\n  " + t("menu_first_run_plan"), "accent", args))
-    try:
-        answer = input(paint(t("menu_first_run_apply_prompt"), "title", args) + " ")
-    except EOFError:
-        answer = ""
-    except KeyboardInterrupt:
-        eprint(t("interrupted"))
-        return 130
-    if not is_yes(answer):
-        print(paint("  " + t("menu_first_run_declined"), "warn", args))
-        time.sleep(1.0)
         return None
+    except KeyboardInterrupt:
+        eprint(t("interrupted"))
+        return 130
+    _render_init_preview(state, init_args)
+    print(paint("\n  " + t("menu_first_run_plan"), "accent", args))
     apply_args = _menu_call_args(args, apply_mode=True)
+    apply_args.set = [key + "=" + str(value) for key, value in answers.items()]
     try:
+        # No prompts remain except the standard init confirmation: every
+        # questionnaire answer is replayed from the single collection above.
         res = cmd_init(apply_args)
         if res not in (0, None):
             return int(res or 1)
@@ -858,8 +855,13 @@ def _menu_first_run(args):
     except KeyboardInterrupt:
         eprint(t("interrupted"))
         return 130
-    print(paint("\n  [OK] " + t("first_run_complete") + "\n", "ok", args))
-    time.sleep(1.5)
+    if _is_initialized():
+        print(paint("\n  [OK] " + t("first_run_complete") + "\n", "ok", args))
+        time.sleep(1.5)
+    else:
+        # The operator declined at the init confirmation: nothing was written.
+        print(paint("  " + t("menu_first_run_declined"), "warn", args))
+        time.sleep(1.0)
     return None
 
 

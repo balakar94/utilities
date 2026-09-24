@@ -21,6 +21,7 @@ from .commands import (
     cmd_rollback,
     cmd_show,
     cmd_status,
+    cmd_sweep,
     cmd_uninstall,
 )
 from .constants import PROG, VERSION
@@ -44,6 +45,7 @@ _HANDLERS = {
     "check": cmd_check, "backup": cmd_backup, "rollback": cmd_rollback,
     "menu": cmd_menu, "status": cmd_status, "enable": cmd_enable,
     "disable": cmd_disable, "export": cmd_export, "uninstall": cmd_uninstall,
+    "sweep": cmd_sweep,
 }
 
 # ---------------------------------------------------------------- parser
@@ -135,6 +137,7 @@ SUBCOMMAND_SPEC = {
         ("--out-dir", {"default": ""}),
     ),
     "uninstall": (),
+    "sweep": (),
 }
 
 

@@ -44,7 +44,7 @@ def _check_peer(peer, index):
     if not isinstance(peer, dict):
         _bad(where + " is not an object")
     name = peer.get("name")
-    if not isinstance(name, str) or not NAME_RE.match(name) or ".." in name or "/" in name:
+    if not isinstance(name, str) or not NAME_RE.fullmatch(name) or ".." in name or "/" in name:
         _bad(where + ".name")
     role = peer.get("role", "client")
     if role not in _PEER_ROLES:
@@ -59,6 +59,27 @@ def _check_peer(peer, index):
         value = peer.get(key)
         if value is not None and not isinstance(value, str):
             _bad(where + "." + key)
+    # Semantic checks for network fields: reject control chars / injections.
+    import ipaddress as _ip
+    for key in ("v4", "v6"):
+        raw = peer.get(key)
+        if raw:
+            txt = str(raw).strip()
+            if any(c in txt for c in ("\n", "\r", "\x00", " ", ";", '"', "'", "#", "`", "|", "&")):
+                _bad(where + "." + key)
+            try:
+                _ip.ip_address(txt.split("/")[0].strip())
+            except ValueError:
+                _bad(where + "." + key)
+    for key in ("pubkey", "privkey", "psk"):
+        raw = peer.get(key)
+        if raw and any(c in str(raw) for c in ("\n", "\r", "\x00", " ", ";", '"', "'")):
+            _bad(where + "." + key)
+    endpoint = peer.get("endpoint")
+    if endpoint:
+        txt = str(endpoint)
+        if any(c in txt for c in ("\n", "\r", "\x00", '"', "'", ";", "#", "`", "|", "&", "<", ">", " ", "\t")):
+            _bad(where + ".endpoint")
     for key in ("keepalive", "expires_at"):
         value = peer.get(key)
         if value is not None and not _is_int(value):
@@ -68,8 +89,18 @@ def _check_peer(peer, index):
         if value is not None and not isinstance(value, bool):
             _bad(where + "." + key)
     routes = peer.get("custom_routes")
-    if routes is not None and not isinstance(routes, list):
-        _bad(where + ".custom_routes")
+    if routes is not None:
+        if not isinstance(routes, list):
+            _bad(where + ".custom_routes")
+        for route in routes:
+            if not isinstance(route, str):
+                _bad(where + ".custom_routes[]")
+            if any(c in route for c in ("\n", "\r", "\x00", " ", ";", '"', "'", "#")):
+                _bad(where + ".custom_routes[]")
+            try:
+                _ip.ip_network(route, strict=False)
+            except ValueError:
+                _bad(where + ".custom_routes[]")
 
 
 def _check_server(server):
@@ -79,9 +110,17 @@ def _check_server(server):
         value = server.get(key)
         if value is not None and not isinstance(value, str):
             _bad("server." + key)
+    endpoint = server.get("endpoint")
+    if endpoint:
+        txt = str(endpoint)
+        if any(c in txt for c in ("\n", "\r", "\x00", '"', "'", ";", "#", "`", "|", "&", "<", ">", " ", "\t")):
+            _bad("server.endpoint")
     ifname = server.get("ifname")
-    if ifname is not None and not IFNAME_RE.match(ifname):
+    if ifname is not None and not IFNAME_RE.fullmatch(ifname):
         _bad("server.ifname")
+    wan = server.get("wan_iface") or server.get("wan")
+    if wan is not None and not IFNAME_RE.fullmatch(str(wan)):
+        _bad("server.wan_iface")
     backend = server.get("backend")
     if backend is not None and backend not in _BACKENDS:
         _bad("server.backend")
@@ -97,8 +136,24 @@ def _check_server(server):
     if _is_int(server.get("mtu")) and not 1280 <= server["mtu"] <= 9000:
         _bad("server.mtu range")
     original = server.get("sysctl_original")
-    if original is not None and not isinstance(original, dict):
-        _bad("server.sysctl_original")
+    if original is not None:
+        if not isinstance(original, dict):
+            _bad("server.sysctl_original")
+        for key, value in original.items():
+            if not re.fullmatch(r"net\.[a-z0-9_.]+", str(key)) or not re.fullmatch(r"-?\d+", str(value)):
+                _bad("server.sysctl_original[]")
+    dns = server.get("dns")
+    if dns is not None:
+        if not isinstance(dns, list):
+            _bad("server.dns")
+        import ipaddress as _ip2
+        for entry in dns:
+            if not isinstance(entry, str):
+                _bad("server.dns[]")
+            try:
+                _ip2.ip_address(entry.strip())
+            except ValueError:
+                _bad("server.dns[]")
 
 
 def validate_state(data):
@@ -112,17 +167,64 @@ def validate_state(data):
     if not isinstance(server, dict):
         _bad("server is not an object")
     _check_server(server)
+    import ipaddress as _ip3
     for section in ("ipv4", "ipv6"):
         value = data.get(section, {})
         if not isinstance(value, dict):
             _bad(section + " is not an object")
+    v4 = data.get("ipv4", {})
+    if v4.get("prefix"):
+        try:
+            _ip3.ip_network(str(v4["prefix"]), strict=False)
+        except ValueError:
+            _bad("ipv4.prefix")
+    if v4.get("hub"):
+        try:
+            _ip3.ip_address(str(v4["hub"]).split("/")[0].strip())
+        except ValueError:
+            _bad("ipv4.hub")
+    v6 = data.get("ipv6", {})
+    if v6.get("prefix"):
+        try:
+            _ip3.ip_network(str(v6["prefix"]), strict=False)
+        except ValueError:
+            _bad("ipv6.prefix")
+    if v6.get("hub"):
+        try:
+            _ip3.ip_address(str(v6["hub"]).split("/")[0].strip())
+        except ValueError:
+            _bad("ipv6.hub")
+    if v6.get("wan_v6"):
+        txt = str(v6["wan_v6"]).strip()
+        try:
+            _ip3.ip_network(txt, strict=False) if "/" in txt else _ip3.ip_address(txt)
+        except ValueError:
+            _bad("ipv6.wan_v6")
     ipv6_mode = data.get("ipv6", {}).get("mode")
     if ipv6_mode is not None and ipv6_mode not in _IPV6_MODES:
         _bad("ipv6.mode")
-    for section in ("pools_v4", "pools_v6", "peers"):
-        value = data.get(section, [])
-        if not isinstance(value, list):
+    for section in ("pools_v4", "pools_v6"):
+        pools = data.get(section, [])
+        if not isinstance(pools, list):
             _bad(section + " is not a list")
+        for idx, pool in enumerate(pools):
+            where = section + "[" + str(idx) + "]"
+            if not isinstance(pool, dict):
+                _bad(where + " is not an object")
+            name = pool.get("name")
+            if not isinstance(name, str) or not NAME_RE.fullmatch(name):
+                _bad(where + ".name")
+            rng = pool.get("range")
+            if not isinstance(rng, str) or not rng.strip():
+                _bad(where + ".range")
+            if any(c in rng for c in ("\n", "\r", "\x00", ";", '"', "'")):
+                _bad(where + ".range")
+            kind = pool.get("kind")
+            if kind is not None and kind not in ("static", "next-free"):
+                _bad(where + ".kind")
+    peers = data.get("peers", [])
+    if not isinstance(peers, list):
+        _bad("peers is not a list")
     for index, peer in enumerate(data.get("peers", [])):
         _check_peer(peer, index)
     return True
@@ -340,9 +442,11 @@ def locked_state(default_if_missing=False):
 
 
 def save_state(state):
+    validate_state(state)
     backup_state_file()
     payload = json.dumps(state, indent=2, sort_keys=True, ensure_ascii=False) + "\n"
     atomic_write(state_path(), payload, mode=0o600)
+    _write_state_marker()
 
 
 def _audit_clean(value):
@@ -415,8 +519,34 @@ def _is_initialized():
     return "schema_version" in data
 
 
+STATE_MARKER = ".wg-manager-root"
+STATE_MARKER_CONTENT = "wg-manager-state-v1\n"
+
+
+def _write_state_marker():
+    try:
+        marker = state_dir() / STATE_MARKER
+        if not marker.exists():
+            marker.write_text(STATE_MARKER_CONTENT, encoding="ascii")
+            try:
+                os.chmod(marker, 0o600)
+            except OSError:
+                pass
+    except OSError:
+        pass
+
+
+def _has_state_marker(sdir=None):
+    try:
+        base = Path(sdir) if sdir is not None else state_dir()
+        marker = base / STATE_MARKER
+        return marker.is_file() and not marker.is_symlink() and marker.read_text(encoding="ascii", errors="strict") == STATE_MARKER_CONTENT
+    except (OSError, ValueError, UnicodeError):
+        return False
+
+
 def remove_state_data():
-    """Remove all state files, rendered configs, backups, and state directory."""
+    """Remove only manager-owned state files; never wipe an unmarked parent."""
     sdir = state_dir()
     if not sdir.exists():
         return True
@@ -425,27 +555,46 @@ def remove_state_data():
     except OSError:
         resolved = sdir
     if str(resolved) in ("/", "/etc", "/usr", "/var", "/home", "/root", "/tmp"):
-        for target in ("state.json", "state.lock", "audit.log"):
-            p = sdir / target
-            if p.exists():
-                try:
-                    p.unlink()
-                except OSError:
-                    pass
-        for sub in ("rendered", "backups"):
-            p = sdir / sub
-            if p.is_dir():
-                try:
-                    shutil.rmtree(str(p))
-                except OSError:
-                    pass
-        return True
+        return _remove_known_state_files(sdir)
+    if sdir.is_symlink():
+        return _remove_known_state_files(sdir)
+    if not _has_state_marker(sdir):
+        # Fail closed: a custom WG_MANAGER_STATE parent without our marker
+        # must never be recursively deleted.
+        return _remove_known_state_files(sdir)
     try:
         shutil.rmtree(str(sdir))
         return True
     except OSError as exc:
         eprint(str(exc))
         return False
+
+
+def _remove_known_state_files(sdir):
+    """Selective deletion of known manager files inside an untrusted parent."""
+    ok = True
+    for target in ("state.json", "state.lock", "audit.log", "audit.log.1", STATE_MARKER):
+        p = sdir / target
+        try:
+            if p.is_symlink() or not p.exists():
+                continue
+            if p.is_file():
+                p.unlink()
+        except OSError:
+            ok = False
+    for sub in ("rendered", "backups", "clients"):
+        p = sdir / sub
+        try:
+            if p.is_symlink() or not p.is_dir():
+                continue
+            shutil.rmtree(str(p))
+        except OSError:
+            ok = False
+    try:
+        sdir.rmdir()
+    except OSError:
+        pass
+    return ok
 
 
 

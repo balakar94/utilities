@@ -14,7 +14,7 @@ from .presentation import eprint
 
 # ---------------------------------------------------------------- validators
 def validate_name(name):
-    if not isinstance(name, str) or not NAME_RE.match(name):
+    if not isinstance(name, str) or not NAME_RE.fullmatch(name):
         raise ValueError(t("err_invalid_name"))
     if ".." in name or "/" in name or "\\" in name:
         raise ValueError(t("err_path_traversal").format(value=name))
@@ -55,10 +55,45 @@ def validate_ip(value):
 
 
 def validate_endpoint(value):
-    s = str(value)
-    if not s.strip() or "\n" in s or "\r" in s:
+    s = str(value).strip()
+    if not s or len(s) > 253 or any(c in s for c in ("\n", "\r", "\x00", " ", "\t", '"', "'", ";", "#", "$", "`", "\\", "|", "&", "<", ">", "(", ")", "{", "}")):
         raise ValueError(t("err_invalid_endpoint"))
-    return s.strip()
+    # Accept hostname / IPv4 / IPv6 (bare or bracketed) with optional :port.
+    host = s
+    if host.startswith("["):
+        if "]" not in host:
+            raise ValueError(t("err_invalid_endpoint"))
+        end = host.index("]")
+        inside = host[1:end]
+        rest = host[end + 1:]
+        try:
+            import ipaddress as _ip
+            _ip.ip_address(inside)
+        except ValueError:
+            raise ValueError(t("err_invalid_endpoint"))
+        if rest and not re.fullmatch(r":\d{1,5}", rest):
+            raise ValueError(t("err_invalid_endpoint"))
+        return s
+    # Split optional trailing :port (single colon, not IPv6 with multiple colons).
+    base = s
+    if s.count(":") == 1 and re.fullmatch(r"[A-Za-z0-9._-]+:\d{1,5}", s):
+        base = s.rsplit(":", 1)[0]
+    elif s.count(":") >= 2:
+        # Bare IPv6 literal.
+        try:
+            import ipaddress as _ip
+            _ip.ip_address(s)
+            return s
+        except ValueError:
+            raise ValueError(t("err_invalid_endpoint"))
+    if not re.fullmatch(r"[A-Za-z0-9._-]+", base):
+        # Allow IPv4 literal explicitly.
+        try:
+            import ipaddress as _ip
+            _ip.ip_address(base)
+        except ValueError:
+            raise ValueError(t("err_invalid_endpoint"))
+    return s
 
 
 def validate_traffic(value):
@@ -95,7 +130,9 @@ def validate_safe_path(value):
 def validate_ifname(value):
     """Audit fix: C4 - strict Linux interface name, safe in nft/sysctl keys."""
     s = str(value)
-    if not IFNAME_RE.match(s):
+    if not IFNAME_RE.fullmatch(s):
+        raise ValueError(t("err_invalid_ifname").format(value=value))
+    if s in ("lo", ".", ".."):
         raise ValueError(t("err_invalid_ifname").format(value=value))
     return s
 
