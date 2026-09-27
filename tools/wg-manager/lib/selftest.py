@@ -11,6 +11,7 @@ from pathlib import Path
 
 from .commands import cmd_reconfigure, cmd_reload
 from .crypto import is_valid_wgkey
+from .errors import WgError
 from .i18n import CONFIRM_TOKENS, STRINGS, detect_system_lang, t
 from .ipam import (
     IPAMError,
@@ -250,7 +251,7 @@ def cmd_self_test(_args=None):
                     os.environ.pop("WG_MANAGER_STATE", None)
                 else:
                     os.environ["WG_MANAGER_STATE"] = old_state
-    except (OSError, ValueError, SystemExit) as exc:
+    except (OSError, ValueError, SystemExit, WgError) as exc:
         fail("reconfigure dry-run raised: " + str(exc))
     # 11. Color disabled in pipes (plain substrings preserved).
     try:
@@ -446,10 +447,30 @@ def cmd_self_test(_args=None):
             _cmdmod._stdin_isatty = _saved_isatty
             _cmdmod.check_wan_overlap = _saved_overlap
             _cmdmod.check_wan_v6_onlink = _saved_onlink
-    except SystemExit as exc:
-        fail("init collector raised SystemExit: " + str(exc.code))
+    except (SystemExit, WgError) as exc:
+        fail("init collector raised: " + str(getattr(exc, "exit_code", getattr(exc, "code", "?"))))
     except (ValueError, KeyError) as exc:
         fail("init collector raised: " + str(exc))
+    # 17. Single dispatch table: every parser subcommand resolves, only the
+    # "menu" placeholder is non-callable, and the CLI table replaces just it
+    # (anti-drift guard for the cli/tui shared dispatch).
+    try:
+        from . import cli as _cli_mod
+        from . import commands as _commands_mod
+        from . import tui as _tui_mod
+        if set(_commands_mod.HANDLERS) != set(_cli_mod.SUBCOMMAND_SPEC):
+            fail("HANDLERS keys != parser subcommands")
+        bad = sorted(k for k, v in _commands_mod.HANDLERS.items() if k != "menu" and not callable(v))
+        if bad:
+            fail("HANDLERS non-callable: " + ",".join(bad))
+        if _commands_mod.HANDLERS.get("menu") is not None:
+            fail("HANDLERS menu placeholder must stay None")
+        if _cli_mod._HANDLERS.get("menu") is not _tui_mod.cmd_menu:
+            fail("CLI menu handler is not tui.cmd_menu")
+        if _cli_mod._HANDLERS.get("sweep") is not _commands_mod.HANDLERS.get("sweep"):
+            fail("CLI sweep diverged from canonical table")
+    except ImportError as exc:
+        fail("dispatch import failed: " + str(exc))
     if failures:
         for item in failures:
             eprint(t("selftest_fail").format(detail=item))

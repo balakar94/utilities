@@ -6,30 +6,14 @@ import time
 from pathlib import Path
 
 from .commands import (
+    HANDLERS,
     _collect_init_proposal,
     _peer_state,
     _render_init_preview,
-    cmd_add,
-    cmd_backup,
-    cmd_check,
-    cmd_delete,
-    cmd_disable,
-    cmd_edit,
-    cmd_enable,
-    cmd_export,
     cmd_init,
-    cmd_list,
-    cmd_purge,
-    cmd_qr,
-    cmd_reclaim,
-    cmd_reconfigure,
-    cmd_reload,
-    cmd_rollback,
-    cmd_show,
-    cmd_status,
-    cmd_uninstall,
 )
 from .constants import C_ERR, C_OK, DEFAULT_STATE_PATH, PROG, VERSION
+from .errors import WgError
 from .i18n import current_lang, t
 from .ipam import peers_sorted
 from .presentation import (
@@ -110,27 +94,9 @@ def _menu_frame_width(args):
 
 
 
-_HANDLERS = {
-    "init": cmd_init,
-    "add": cmd_add,
-    "edit": cmd_edit,
-    "delete": cmd_delete,
-    "list": cmd_list,
-    "show": cmd_show,
-    "qr": cmd_qr,
-    "purge": cmd_purge,
-    "reclaim": cmd_reclaim,
-    "reconfigure": cmd_reconfigure,
-    "reload": cmd_reload,
-    "check": cmd_check,
-    "backup": cmd_backup,
-    "rollback": cmd_rollback,
-    "status": cmd_status,
-    "enable": cmd_enable,
-    "disable": cmd_disable,
-    "export": cmd_export,
-    "uninstall": cmd_uninstall,
-}
+# Dispatch uses the canonical HANDLERS table from lib.commands (imported
+# above), so every CLI handler - including sweep - is reachable by name.
+
 
 _SHORTCUTS = {
     "a": "add",
@@ -836,6 +802,10 @@ def _menu_first_run(args):
         if exc.code not in (0, None):
             return int(exc.code or 1)
         return None
+    except WgError as exc:
+        if exc.exit_code:
+            return int(exc.exit_code)
+        return None
     except KeyboardInterrupt:
         eprint(t("interrupted"))
         return 130
@@ -852,6 +822,9 @@ def _menu_first_run(args):
     except SystemExit as exc:
         if exc.code not in (0, None):
             return int(exc.code or 1)
+    except WgError as exc:
+        if exc.exit_code:
+            return int(exc.exit_code)
     except KeyboardInterrupt:
         eprint(t("interrupted"))
         return 130
@@ -878,6 +851,7 @@ def cmd_menu(args):
     by_label = {label.lower(): label for _key, label in items}
     by_label["reconfig"] = "reconfigure"
     by_label["init"] = "init"
+    by_label["sweep"] = "sweep"
     by_label["help"] = "help"
     by_label["ayuda"] = "help"
     flash = None
@@ -937,13 +911,17 @@ def cmd_menu(args):
                         _menu_pause_tty(args)
                         continue
                     call_args.yes = True
-            result = _HANDLERS[hit](call_args)
+            result = HANDLERS[hit](call_args)
             if result not in (0, None):
                 ok = False
         except SystemExit as exc:
             ok = exc.code in (0, None)
             if not ok:
                 eprint(cwrap(str(exc.code), C_ERR, args))
+        except WgError as exc:
+            ok = False
+            if str(exc):
+                eprint(str(exc))
         except KeyboardInterrupt:
             eprint(t("interrupted"))
             return 130

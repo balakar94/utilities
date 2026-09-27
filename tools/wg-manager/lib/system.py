@@ -11,6 +11,7 @@ from pathlib import Path
 
 from .constants import SYSROOT
 from .crypto import validate_key_material
+from .errors import WgError
 from .i18n import t
 from .presentation import emit, eprint, note, section
 from .renderers import (
@@ -96,8 +97,7 @@ def require_apply(args, cmd):
         emit(note(t("msg_dry_run"), "dryrun", args, indent=1))
         return False
     if not getattr(args, "yes", False):
-        emit(note(t("err_need_apply_yes"), "err", args, indent=1), stream="err")
-        raise SystemExit(2)
+        raise WgError(note(t("err_need_apply_yes"), "err", args, indent=1), 2)
     if SYSROOT:
         # Test seam: every system path is already redirected under SYSROOT
         # (and firewall execution is skipped), so a sandboxed apply does not
@@ -105,26 +105,22 @@ def require_apply(args, cmd):
         # check keeps the seam out of reach of a stray env var in production.
         if os.environ.get("WG_MANAGER_ALLOW_SYSROOT_APPLY") == "1":
             return True
-        emit(note(t("err_need_root").format(cmd=cmd), "err", args, indent=1), stream="err")
-        raise SystemExit(1)
+        raise WgError(note(t("err_need_root").format(cmd=cmd), "err", args, indent=1))
     try:
         euid = os.geteuid()
     except AttributeError:
         euid = 1000
     if euid != 0 and not getattr(args, "sudo", False):
-        emit(note(t("err_need_root").format(cmd=cmd), "err", args, indent=1), stream="err")
-        raise SystemExit(1)
+        raise WgError(note(t("err_need_root").format(cmd=cmd), "err", args, indent=1))
     if euid != 0 and getattr(args, "sudo", False):
         sudo = shutil.which("sudo")
         if not sudo:
-            emit(note(t("err_need_root").format(cmd=cmd), "err", args, indent=1), stream="err")
-            raise SystemExit(1)
+            raise WgError(note(t("err_need_root").format(cmd=cmd), "err", args, indent=1))
         # Re-exec the real entrypoint (repo main.py or the installed zipapp),
         # never this library module.
         entry = os.path.abspath(sys.argv[0] or "")
         if not entry or not os.path.exists(entry):
-            emit(note(t("err_need_root").format(cmd=cmd), "err", args, indent=1), stream="err")
-            raise SystemExit(1)
+            raise WgError(note(t("err_need_root").format(cmd=cmd), "err", args, indent=1))
         os.execvp(sudo, [sudo, sys.executable, entry] + sys.argv[1:])
     return True
 

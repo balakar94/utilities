@@ -2,28 +2,7 @@
 import argparse
 import sys
 
-from .commands import (
-    cmd_add,
-    cmd_backup,
-    cmd_check,
-    cmd_delete,
-    cmd_disable,
-    cmd_edit,
-    cmd_enable,
-    cmd_export,
-    cmd_init,
-    cmd_list,
-    cmd_purge,
-    cmd_qr,
-    cmd_reclaim,
-    cmd_reconfigure,
-    cmd_reload,
-    cmd_rollback,
-    cmd_show,
-    cmd_status,
-    cmd_sweep,
-    cmd_uninstall,
-)
+from .commands import HANDLERS
 from .constants import PROG, VERSION
 from .errors import WgError
 from .i18n import (
@@ -38,15 +17,11 @@ from .presentation import eprint, usage
 from .selftest import cmd_self_test
 from .tui import cmd_menu
 
-_HANDLERS = {
-    "init": cmd_init, "add": cmd_add, "edit": cmd_edit, "delete": cmd_delete,
-    "list": cmd_list, "show": cmd_show, "qr": cmd_qr, "purge": cmd_purge,
-    "reclaim": cmd_reclaim, "reconfigure": cmd_reconfigure, "reload": cmd_reload,
-    "check": cmd_check, "backup": cmd_backup, "rollback": cmd_rollback,
-    "menu": cmd_menu, "status": cmd_status, "enable": cmd_enable,
-    "disable": cmd_disable, "export": cmd_export, "uninstall": cmd_uninstall,
-    "sweep": cmd_sweep,
-}
+# Frontend dispatch extends the canonical table in lib.commands: "menu" is the
+# only CLI-only entry (its handler lives in tui.py, so commands.py carries a
+# placeholder for it instead of importing tui and creating a cycle).
+_HANDLERS = dict(HANDLERS)
+_HANDLERS["menu"] = cmd_menu
 
 # ---------------------------------------------------------------- parser
 COMMON_SPEC = (
@@ -251,7 +226,9 @@ def main(argv=None):
     try:
         return int(func(args) or 0)
     except WgError as exc:
-        eprint(str(exc))
+        # Empty message: already emitted at the raise site (see errors.py).
+        if str(exc):
+            eprint(str(exc))
         return exc.exit_code
     except FileNotFoundError as exc:
         eprint(str(exc))

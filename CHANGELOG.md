@@ -86,6 +86,9 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/). This p
 
 ### wg-manager
 
+- Single error and dispatch path: handlers raise `WgError` instead of bare `SystemExit`
+  (one `HANDLERS` table shared by CLI and TUI, `sweep` reachable from the menu by
+  name); CLI/TUI output and exit codes unchanged.
 - CLI and safety fixes: `--sudo` re-executes the real entrypoint, `--dry-run`
   prevails over `--apply`, the TUI has an explicit mode with destructive-action
   confirmations, infra-peer `edit` redacts secrets, `check` returns a real exit
