@@ -8,6 +8,7 @@ import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 from .constants import REQUIRED_INIT_KEYS, SCHEMA_VERSION, SYSROOT, TAG
 from .crypto import is_valid_wgkey, validate_key_material, wggen, wgpsk, wgpub
@@ -48,6 +49,7 @@ from .presentation import (
     usage,
     wrap_text,
 )
+from .reconcile import compute_plan, plan_summary
 from .renderers import (
     _is_active_peer,
     _peer_is_expired,
@@ -62,6 +64,13 @@ from .renderers import (
     render_rsc,
     render_sysctl,
     render_wgquick,
+)
+from .spec import (
+    SPEC_API,
+    _normalize_peer,
+    load_spec_document,
+    normalize_spec,
+    resolve_psk,
 )
 from .state import (
     _is_initialized,
@@ -98,6 +107,7 @@ from .system import (
 )
 from .validators import (
     _prefix_is_ula,
+    find_allowed_ips_overlaps,
     parse_routes_csv,
     parse_set_pairs,
     validate_backend,
@@ -1683,9 +1693,13 @@ def cmd_check(args):
             nft_ok = False
     if nft_ok:
         results.append(("ok", t("check_firewall_ok")))
+    elif fw_choice == "firewalld":
+        # firewalld renders no `wg_manager` nft table; its trusted-zone and port
+        # checks below are authoritative. Only report a genuinely missing engine.
+        if not shutil.which("firewall-cmd"):
+            results.append(("skip", t("check_firewall_missing").format(engine=fw_choice, binary="firewall-cmd")))
     else:
-        missing_binary = "firewall-cmd" if fw_choice == "firewalld" else "nft"
-        results.append(("skip", t("check_firewall_missing").format(engine=fw_choice, binary=missing_binary)))
+        results.append(("skip", t("check_firewall_missing").format(engine=fw_choice, binary="nft")))
     # Audit host base filter table for drop policy conflicts. Only a drop
     # policy on input/forward matters, and only rules actually tagged by this
     # tool count as coverage.
@@ -1700,8 +1714,13 @@ def cmd_check(args):
                 tagged_lines = [ln for ln in txt.splitlines() if 'comment "wg-manager"' in ln]
                 has_wg_input = any(("udp dport " + str(srv.get("port", 51820))) in ln for ln in tagged_lines)
                 has_wg_fwd = any(('iifname "' + str(ifname) + '"') in ln for ln in tagged_lines)
+                has_wg_fwd_out = any(('oifname "' + str(ifname) + '"') in ln for ln in tagged_lines)
                 if has_drop and (not has_wg_input or not has_wg_fwd):
                     results.append(("warn", t("check_host_firewall_conflict")))
+                elif has_drop and not has_wg_fwd_out:
+                    # Only established/related is accepted outbound, so a host
+                    # default-drop blocks hub-initiated NEW flows to peers.
+                    results.append(("warn", t("check_hub_to_peer_blocked").format(iface=ifname)))
                 elif has_drop:
                     results.append(("ok", t("check_host_firewall_ok")))
         except (OSError, subprocess.SubprocessError):
@@ -1891,6 +1910,11 @@ def cmd_check(args):
                 results.append(("warn", t("check_handshake_stale").format(name=peer.get("name", ""), age=age)))
             else:
                 results.append(("ok", t("check_handshake_ok").format(name=peer.get("name", ""), age=age)))
+    # Overlapping advertised prefixes across active peers: the kernel last-wins,
+    # so flag them instead of silently misrouting.
+    for name_a, name_b, net_a, net_b in find_allowed_ips_overlaps(state):
+        results.append(("warn", t("check_allowedips_overlap").format(
+            a=name_a, b=name_b, net_a=net_a, net_b=net_b)))
     # Expected-live-state: kernel peers should match configured active peers.
     if wg_ok and iface_ok:
         expected_keys = {str(p.get("pubkey", "")) for p in state.get("peers", [])
@@ -2280,6 +2304,424 @@ def cmd_uninstall(args):
     return 0
 
 
+# ---------------------------------------------------------------- declarative
+def _try_reexec_sudo(args):
+    """Re-exec through sudo when not root and it would help a read.
+
+    Mirrors require_apply()'s escalation, but for read-first commands that must
+    reach the root-owned 0700 state directory. Returns True when the process
+    was replaced (caller must stop), False otherwise.
+    """
+    try:
+        euid = os.geteuid()
+    except AttributeError:
+        return False
+    if euid == 0:
+        return False
+    if not (getattr(args, "sudo", False) or getattr(args, "apply", False)):
+        return False
+    sudo = shutil.which("sudo")
+    entry = os.path.abspath(sys.argv[0] or "")
+    if not sudo or not entry or not os.path.exists(entry):
+        return False
+    os.execvp(sudo, [sudo, sys.executable, entry] + sys.argv[1:])
+    return True
+
+
+def _load_desired(args):
+    """Load and normalize the spec referenced by --config."""
+    config = getattr(args, "config", "") or ""
+    if not config:
+        raise WgError(usage(), 2)
+    return normalize_spec(load_spec_document(config))
+
+
+def _format_change(change):
+    action = change.get("action")
+    resource = change.get("resource", "")
+    name = change.get("name", "")
+    if action == "add":
+        return t("reconcile_add").format(resource=resource, name=name)
+    if action == "delete":
+        return t("reconcile_delete").format(resource=resource, name=name)
+    return t("reconcile_change").format(resource=resource, name=name,
+                                        field=change.get("field", ""), old=change.get("old"),
+                                        new=change.get("new"))
+
+
+def _redact_change(change):
+    out = dict(change)
+    if out.get("field") in ("psk", "pubkey"):
+        out["old"] = "<redacted>" if out.get("old") is not None else None
+        out["new"] = "<redacted>" if out.get("new") is not None else None
+    return out
+
+
+def _report_plan(changes, config, args):
+    if getattr(args, "json", False):
+        payload = {
+            "apiVersion": SPEC_API,
+            "dry_run": True,
+            "changed": bool(changes),
+            "config": str(config),
+            "summary": plan_summary(changes),
+            "changes": [_redact_change(c) for c in changes],
+        }
+        print(json.dumps(payload, indent=2, sort_keys=True))
+        return
+    emit(banner("wg-manager plan", [("spec", str(config))], args))
+    if not changes:
+        emit(note(t("reconcile_no_changes"), "ok", args, indent=1))
+        return
+    emit(["", section("changes", args)])
+    for change in changes:
+        emit(note(_format_change(change), "info", args, indent=1))
+    emit(note(t("reconcile_planned").format(count=len(changes)), "dryrun", args, indent=1))
+
+
+def cmd_plan(args):
+    desired = _load_desired(args)
+    try:
+        state = load_state()
+    except (FileNotFoundError, ValueError):
+        # A non-root user cannot read the root-owned 0700 state dir: re-exec
+        # through sudo when asked or when privilege would let the read succeed.
+        if _try_reexec_sudo(args):
+            raise WgError("")
+        state = load_state_or_default(args)
+    changes = compute_plan(state, desired, prune=bool(getattr(args, "prune", False)))
+    _report_plan(changes, getattr(args, "config", ""), args)
+    if changes and getattr(args, "detailed_exitcode", False):
+        return 3
+    return 0
+
+
+def _spec_peer_new(state, spec_peer, args):
+    """Build a brand-new peer dict from a normalized spec peer."""
+    name = spec_peer["name"]
+    role = spec_peer.get("role", "client")
+    kind = spec_peer.get("kind", "ondemand")
+    infra_type = spec_peer.get("infra_type", "")
+    pool_name = spec_peer.get("pool", "")
+    if not pool_name:
+        pool_name = "infra" if role == "infra" and (find_pool(state, "infra", 4) or find_pool(state, "infra", 6)) else "clients"
+    if find_pool(state, pool_name, 4) is None and find_pool(state, pool_name, 6) is None:
+        fallback = default_pool(state, 4) or default_pool(state, 6)
+        pool_name = fallback.get("name", "clients") if fallback else "clients"
+    traffic = spec_peer.get("traffic") or ("server-only" if role == "infra" else "full-tunnel")
+    validate_routes_for_role(spec_peer.get("custom_routes", []) or [], role)
+    ns = SimpleNamespace(ip=spec_peer.get("ip", ""), ip6=spec_peer.get("ip6", ""))
+    # A spec-pinned address is authoritative: for an infra peer with an explicit
+    # `ip`, add or reuse a static pool that contains it when the chosen pool does
+    # not, so an out-of-span infra address is not rejected.
+    if role == "infra" and spec_peer.get("ip"):
+        target = str(spec_peer["ip"]).split("/")[0]
+        containing = None
+        for pool in state.get("pools_v4", []):
+            if pool.get("name") == pool_name:
+                continue
+            try:
+                if parse_pool_range(pool.get("range", ""), 4).contains(ipaddress.ip_address(target)):
+                    containing = pool
+                    break
+            except (ValueError, TypeError):
+                continue
+        if containing is not None:
+            pool_name = containing["name"]
+        else:
+            # Never repurpose the pool the peer asked for: create a dedicated
+            # static pool named after the peer so the spec's `clients` pool is
+            # left intact (otherwise reconcile never converges).
+            static_name = spec_peer["name"]
+            static_range = target + "-" + target
+            for pool in state.get("pools_v4", []):
+                if pool.get("name") == static_name:
+                    pool["range"] = static_range
+                    break
+            else:
+                state.setdefault("pools_v4", []).append(
+                    {"name": static_name, "range": static_range, "kind": "static"})
+            pool_name = static_name
+    v4, v6 = _allocate_peer_ips(state, pool_name, role, kind, ns)
+    pubkey = spec_peer.get("pubkey", "")
+    privkey = ""
+    if not pubkey:
+        if role == "infra" and infra_type == "server":
+            raise WgError(t("err_invalid_wgkey").format(path="peer " + name + " (server peer needs pubkey)"))
+        privkey = wggen()
+        pubkey = wgpub(privkey)
+    psk = ""
+    if not spec_peer.get("no_psk"):
+        psk = resolve_psk(spec_peer.get("psk", "generate")) or ""
+    expires_spec = spec_peer.get("expires", "")
+    expires_at = validate_expiry(expires_spec) if expires_spec else None
+    peer = {
+        "name": name, "role": role, "kind": kind, "infra_type": infra_type,
+        "traffic": traffic, "v4": v4, "v6": v6, "pubkey": pubkey, "privkey": privkey,
+        "psk": psk, "endpoint": spec_peer.get("endpoint", ""),
+        "keepalive": spec_peer.get("keepalive", 25), "dns_scope": spec_peer.get("dns_scope", "none"),
+        "custom_routes": spec_peer.get("custom_routes", []), "pool": pool_name,
+        "enabled": spec_peer.get("enabled", True), "tombstoned": False,
+        "created": datetime.now(timezone.utc).isoformat(), "expires_at": expires_at,
+    }
+    if expires_spec:
+        peer["expires_spec"] = expires_spec
+    return peer
+
+
+def _spec_peer_update(state, peer, spec_peer):
+    """Merge spec-declared fields into an existing peer (no implicit re-keying)."""
+    for field in ("traffic", "dns_scope", "keepalive", "endpoint", "enabled"):
+        if field in spec_peer:
+            peer[field] = spec_peer[field]
+    if "custom_routes" in spec_peer:
+        validate_routes_for_role(spec_peer["custom_routes"], peer.get("role"))
+        peer["custom_routes"] = spec_peer["custom_routes"]
+    if "pubkey" in spec_peer:
+        peer["pubkey"] = spec_peer["pubkey"]
+        peer["privkey"] = ""
+    if "pool" in spec_peer and spec_peer["pool"] != peer.get("pool"):
+        pool_name = spec_peer["pool"]
+        pool_v4 = find_pool(state, pool_name, 4)
+        if pool_v4 is None:
+            raise WgError(t("err_pool_not_found").format(pool=pool_name))
+        others = [p for p in state.get("peers", []) if p is not peer]
+        hub = state.get("ipv4", {}).get("hub", "")
+        fresh = next_free_ip(pool_v4["range"], others, hub)
+        if not fresh:
+            raise WgError(exhaustion_message(pool_name, pool_v4["range"], state.get("peers", [])))
+        peer["v4"] = fresh
+        peer["pool"] = pool_name
+    if "expires" in spec_peer:
+        peer["expires_spec"] = spec_peer["expires"]
+        peer["expires_at"] = validate_expiry(spec_peer["expires"])
+    if spec_peer.get("no_psk"):
+        peer.pop("psk", None)
+    elif spec_peer.get("psk") is not None:
+        raw = spec_peer["psk"]
+        literal = not isinstance(raw, dict) and str(raw).strip().lower() in ("generate", "auto", "yes", "true", "1", "")
+        if not literal:
+            resolved = resolve_psk(raw)
+            if resolved:
+                peer["psk"] = resolved
+    return peer
+
+
+def _apply_spec_to_state(state, desired, prune, args):
+    """Converge `state` to the desired spec; returns the pre-change plan."""
+    changes = compute_plan(state, desired, prune=prune)
+    srv = state.setdefault("server", {})
+    for field in ("endpoint", "port", "mtu", "ifname", "backend", "firewall", "wan_iface", "dns"):
+        if field in desired["server"]:
+            srv[field] = desired["server"][field]
+    v4s = state.setdefault("ipv4", {})
+    for field in ("prefix", "hub"):
+        if field in desired["ipv4"]:
+            v4s[field] = desired["ipv4"][field]
+    ip6 = state.setdefault("ipv6", {})
+    mode_changed = "mode" in desired["ipv6"] and desired["ipv6"]["mode"] != ip6.get("mode", "disabled")
+    prefix_changed = "prefix" in desired["ipv6"] and desired["ipv6"].get("prefix", "") != ip6.get("prefix", "")
+    if mode_changed or prefix_changed:
+        prop = {
+            "endpoint": srv.get("endpoint", ""), "port": srv.get("port", 51820),
+            "mtu": srv.get("mtu", 1420), "wan": srv.get("wan_iface", "eth0"),
+            "ipv6-mode": desired["ipv6"].get("mode", ip6.get("mode", "disabled")),
+            "ipv6-prefix": desired["ipv6"].get("prefix", ip6.get("prefix", "")),
+            "ipv6-wan": desired["ipv6"].get("wan_v6", ip6.get("wan_v6", "")),
+        }
+        _apply_reconfigure_mutations(state, prop)
+    else:
+        for field in ("mode", "prefix", "hub", "wan_v6"):
+            if field in desired["ipv6"]:
+                ip6[field] = desired["ipv6"][field]
+    for family in ("v4", "v6"):
+        spec_pools = desired["pools"].get(family) or []
+        if not spec_pools:
+            continue
+        # Merge spec pools into state (by name) instead of replacing them, so
+        # pools the spec does not mention (e.g. `infra`) survive a reconcile.
+        by_name = {p.get("name"): p for p in state.get("pools_" + family, [])}
+        for pool in spec_pools:
+            by_name[pool["name"]] = dict(pool)
+        state["pools_" + family] = list(by_name.values())
+    current = {p.get("name"): p for p in state.get("peers", [])}
+    desired_names = set()
+    for spec_peer in desired["peers"]:
+        name = spec_peer["name"]
+        desired_names.add(name)
+        cur = current.get(name)
+        if cur is None:
+            state.setdefault("peers", []).append(_spec_peer_new(state, spec_peer, args))
+        else:
+            _spec_peer_update(state, cur, spec_peer)
+    if prune:
+        for name, peer in current.items():
+            if name not in desired_names and not peer.get("tombstoned"):
+                peer["tombstoned"] = True
+                peer["enabled"] = False
+    return changes
+
+
+def cmd_reconcile(args):
+    desired = _load_desired(args)
+    prune = bool(getattr(args, "prune", False))
+    json_mode = bool(getattr(args, "json", False))
+    if getattr(args, "dry_run", False) or not getattr(args, "apply", False):
+        state = load_state_or_default(args)
+        changes = compute_plan(state, desired, prune=prune)
+        _report_plan(changes, getattr(args, "config", ""), args)
+        if not getattr(args, "apply", False):
+            emit(note(t("msg_dry_run"), "dryrun", args, indent=1))
+        return 0
+    if not require_apply(args, "reconcile"):
+        return 0
+    # `--json` must produce a parseable payload on stdout; the apply path prints
+    # per-file chrome through emit()/print(), so send it to stderr instead.
+    original_stdout = sys.stdout
+    if json_mode:
+        sys.stdout = sys.stderr
+    try:
+        with locked_state() as fresh:
+            changes = _apply_spec_to_state(fresh, desired, prune, args)
+            validate_key_material(fresh)
+            try:
+                applied = apply_system_reload(fresh, fresh.get("server", {}).get("backend", "networkd") or "networkd", detect_firewall_default(), args)
+            except OSError as exc:
+                raise WgError(str(exc))
+            if not applied:
+                raise WgError("")
+            save_state(fresh)
+            audit("reconcile", "changes=" + str(len(changes)))
+    finally:
+        if json_mode:
+            sys.stdout = original_stdout
+    if json_mode:
+        print(json.dumps({"apiVersion": SPEC_API, "dry_run": False, "changed": bool(changes),
+                          "summary": plan_summary(changes),
+                          "changes": [_redact_change(c) for c in changes]}, indent=2, sort_keys=True))
+    else:
+        emit(note(t("reconcile_applied").format(count=len(changes)), "applied", args, indent=1))
+    return 0
+
+
+def _peers_from_document(doc):
+    """Accept a JSON array, an NDJSON stream or a spec-like object with peers[]."""
+    if isinstance(doc, list):
+        return doc
+    if isinstance(doc, dict):
+        return doc.get("peers", []) or []
+    return []
+
+
+def _load_peers_input(source, fmt):
+    """Read peers from a file or stdin in json/ndjson/auto format."""
+    if str(source) == "-" or not source:
+        text = sys.stdin.read()
+    else:
+        path = Path(str(source))
+        if not path.exists():
+            raise ValueError(t("err_spec_missing").format(path=source))
+        text = path.read_text(encoding="utf-8")
+    fmt = (fmt or "auto").lower()
+    if fmt == "auto":
+        stripped = text.lstrip()
+        fmt = "json" if stripped.startswith(("[", "{")) else "ndjson"
+    if fmt == "ndjson":
+        out = []
+        for line in text.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                out.append(json.loads(line))
+            except ValueError as exc:
+                raise ValueError(t("err_spec_invalid").format(detail=str(exc)))
+        return out
+    try:
+        doc = json.loads(text)
+    except ValueError as exc:
+        raise ValueError(t("err_spec_invalid").format(detail=str(exc)))
+    return _peers_from_document(doc)
+
+
+def cmd_peers_import(args):
+    """Bulk, idempotent peer import from json/ndjson/stdin (upsert)."""
+    raw_peers = _load_peers_input(getattr(args, "file", ""), getattr(args, "format", "auto"))
+    if not isinstance(raw_peers, list):
+        raise TypeError(t("err_spec_invalid").format(detail="peers is not a list"))
+    peers = []
+    for raw in raw_peers:
+        if not isinstance(raw, dict):
+            raise TypeError(t("err_spec_invalid").format(detail="peer entry is not an object"))
+        peers.append(_normalize_peer(raw))
+    if not peers:
+        emit(note(t("list_empty"), "info", args, indent=1))
+        return 0
+    upsert = bool(getattr(args, "upsert", False))
+    if getattr(args, "dry_run", False) or not getattr(args, "apply", False):
+        state = load_state_or_default(args)
+        names = {p.get("name") for p in state.get("peers", [])}
+        existing = [p["name"] for p in peers if p["name"] in names]
+        if upsert and existing:
+            emit(note(t("msg_dry_run"), "dryrun", args, indent=1))
+        emit(note(t("peers_import_planned").format(total=len(peers), existing=len(existing)), "dryrun", args, indent=1))
+        return 0
+    if not require_apply(args, "peers"):
+        return 0
+    added = 0
+    updated = 0
+    with locked_state() as fresh:
+        for spec_peer in peers:
+            cur = next((p for p in fresh.get("peers", []) if p.get("name") == spec_peer["name"]), None)
+            if cur is None:
+                fresh.setdefault("peers", []).append(_spec_peer_new(fresh, spec_peer, args))
+                added += 1
+            elif upsert:
+                _spec_peer_update(fresh, cur, spec_peer)
+                updated += 1
+            else:
+                raise WgError(t("err_peer_exists").format(name=spec_peer["name"]))
+        validate_key_material(fresh)
+        try:
+            applied = apply_system_reload(fresh, fresh.get("server", {}).get("backend", "networkd") or "networkd", detect_firewall_default(), args)
+        except OSError as exc:
+            raise WgError(str(exc))
+        if not applied:
+            raise WgError("")
+        save_state(fresh)
+        audit("peers-import", "added=" + str(added) + " updated=" + str(updated))
+    emit(note(t("peers_import_done").format(added=added, updated=updated), "applied", args, indent=1))
+    return 0
+
+
+# ---------------------------------------------------------------- metrics
+def cmd_metrics(args):
+    """Read-only Prometheus textfile exporter (`metrics`)."""
+    from .constants import VERSION
+    from .metrics import collect_metrics, render_prometheus
+    state = load_state_or_default(args)
+    samples = collect_metrics(state)
+    if getattr(args, "format", "prometheus") == "json":
+        payload = {
+            "interface": state.get("server", {}).get("ifname", "wg0"),
+            "metrics": [{"name": n, "labels": dict(lb), "value": v} for n, lb, v in samples],
+        }
+        print(json.dumps(payload, indent=2, sort_keys=True))
+        return 0
+    text = render_prometheus(samples, version=VERSION)
+    out = getattr(args, "out", "") or ""
+    if out:
+        validate_safe_path(out)
+        try:
+            atomic_write(Path(out), text, mode=0o644)
+        except OSError as exc:
+            raise WgError(str(exc))
+        emit(note(t("metrics_written").format(path=out), "ok", args, indent=1))
+        return 0
+    print(text, end="")
+    return 0
+
+
 # ---------------------------------------------------------------- dispatch
 # Single source of truth for command dispatch: cli.py extends this table
 # with "menu" (whose handler lives in tui.py), and tui.py dispatches it
@@ -2293,7 +2735,8 @@ HANDLERS = {
     "menu": None,  # placeholder: replaced by cli.py with tui.cmd_menu
     "status": cmd_status, "enable": cmd_enable,
     "disable": cmd_disable, "export": cmd_export, "uninstall": cmd_uninstall,
-    "sweep": cmd_sweep,
+    "sweep": cmd_sweep, "plan": cmd_plan, "reconcile": cmd_reconcile,
+    "metrics": cmd_metrics, "peers": cmd_peers_import,
 }
 
 

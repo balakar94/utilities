@@ -5,6 +5,7 @@ import os
 import re
 import secrets
 import shutil
+import stat
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -249,12 +250,23 @@ def migrate_state(data):
 
 
 # ---------------------------------------------------------------- state
+_FORBIDDEN_STATE_PARENTS = (
+    "/", "/etc", "/usr", "/var", "/home", "/root", "/tmp", "/bin", "/sbin",
+    "/lib", "/lib64", "/boot", "/opt", "/dev", "/proc", "/sys",
+)
+
+
 def state_path():
     raw = os.environ.get("WG_MANAGER_STATE", DEFAULT_STATE_PATH)
     p = Path(str(raw)).expanduser()
     if not p.is_absolute():
         raise ValueError(t("err_state_path").format(path=raw))
     if ".." in p.parts:
+        raise ValueError(t("err_state_path").format(path=raw))
+    # Refuse a state file whose parent is a system directory: the manager
+    # creates and owns its state directory, and must never write state.json
+    # directly into /etc (or lock that directory down as private).
+    if str(p.parent) in _FORBIDDEN_STATE_PARENTS:
         raise ValueError(t("err_state_path").format(path=raw))
     return p
 
@@ -282,10 +294,38 @@ def default_state():
     }
 
 
+def _assert_trusted_state_file(p):
+    """Reject a symlinked state file and, as root, unsafe ownership/mode.
+
+    A structurally valid state file supplied by a lower-privileged actor must
+    not be trusted blindly: it carries server/peer keys and the whole network
+    configuration. Non-root callers keep the historical behaviour.
+    """
+    try:
+        st = os.lstat(str(p))
+    except OSError:
+        return
+    if stat.S_ISLNK(st.st_mode):
+        raise ValueError(t("err_state_insecure").format(path=str(p)))
+    try:
+        euid = os.geteuid()
+    except AttributeError:
+        euid = 1000
+    if euid != 0:
+        return
+    if st.st_uid != 0 or (st.st_mode & 0o077):
+        raise ValueError(t("err_state_insecure").format(path=str(p)))
+
+
 def load_state():
     p = state_path()
-    if not p.exists():
+    try:
+        exists = p.exists()
+    except OSError as exc:
+        raise ValueError(t("err_state_unreadable").format(path=str(p), detail=exc))
+    if not exists:
         raise FileNotFoundError(t("err_state_missing").format(path=str(p)))
+    _assert_trusted_state_file(p)
     try:
         data = json.loads(p.read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc:
@@ -306,13 +346,23 @@ def load_state():
 
 
 def _mkdir_private(path):
-    """Audit fix: N14 - private directories (0700) for state and secrets."""
+    """Audit fix: N14 - private directories (0700) for state and secrets.
+
+    Only the directory we create is tightened: re-chmodding a pre-existing
+    directory would lock down a system parent (e.g. `WG_MANAGER_STATE=/etc/x`
+    must never chmod `/etc` to 0700).
+    """
     p = Path(path)
-    p.mkdir(parents=True, exist_ok=True, mode=0o700)
     try:
-        os.chmod(p, 0o700)
+        existed = p.exists()
     except OSError:
-        pass
+        existed = False
+    p.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if not existed:
+        try:
+            os.chmod(p, 0o700)
+        except OSError:
+            pass
 
 
 def atomic_write(path, content, mode=0o600, gid=None):
@@ -462,7 +512,20 @@ def audit(action, detail=""):
         p = state_dir() / "audit.log"
         _mkdir_private(p.parent)
         user = os.environ.get("SUDO_USER") or os.environ.get("USER") or "root"
-        line = datetime.now(timezone.utc).isoformat() + " user=" + _audit_clean(user) + " action=" + _audit_clean(action) + " " + _audit_clean(detail) + "\n"
+        fmt = str(os.environ.get("WG_MANAGER_LOG_FORMAT", "")).strip().lower()
+        if fmt == "json":
+            # Opt-in structured line for shippers; one JSON object per line.
+            record = {
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "level": "info",
+                "action": _audit_clean(action),
+                "detail": _audit_clean(detail),
+                "user": _audit_clean(user),
+                "pid": os.getpid(),
+            }
+            line = json.dumps(record, sort_keys=True) + "\n"
+        else:
+            line = datetime.now(timezone.utc).isoformat() + " user=" + _audit_clean(user) + " action=" + _audit_clean(action) + " " + _audit_clean(detail) + "\n"
         with open(p, "a", encoding="utf-8") as fh:
             fh.write(line)
         try:

@@ -86,6 +86,39 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/). This p
 
 ### wg-manager
 
+- Correctness and unattended-hardening batch: NetworkManager routes now use the documented
+  `routeN=dest/plen,gateway` keyfile form in the matching family section (the semicolon `routes=`
+  list produced empty next hops); systemd `[Route]` gateways are chosen by destination family
+  (IPv6 routes no longer get an IPv4 next hop); an endpoint carrying `host:port` is split once and
+  no longer double-appends the port or brackets a hostname; NetworkManager applies peer changes with
+  `nmcli device reapply` plus `wg syncconf`; the state file is trusted only when it is a regular,
+  root-owned `0600` file outside system directories (symlinks rejected); the `SYSROOT` seam is
+  sanitized; `_mkdir_private` never chmods a pre-existing system parent; the daily expiry timer uses
+  an absolute `ExecStart` with `NoNewPrivileges=`, `ProtectHome=` and `PrivateTmp=`; and
+  `install.sh --verify` checks the installed binary against the manifest `binary_sha256`. The test
+  suite adds renderer, endpoint, state-trust and failure-injection rollback coverage.
+- Live-host fixes found while validating on real Ubuntu 24.04 (systemd-networkd + nftables) and
+  Fedora 44 (NetworkManager + firewalld): `--sudo` re-executes before any handler reads state, so a
+  non-root operator can use it against the `0700 root` state directory (a non-root read now fails
+  with an actionable message, not a traceback); `check` no longer reports `firewall-cmd` as missing
+  on a firewalld host; and the installer updates the manifest's `binary_sha256` after `--restore`, so
+  `--verify` stays consistent with the reinstalled binary. The end-to-end lifecycle (init, add,
+  reconfigure, edit, reload idempotency, check, status, sweep, timer lifecycle, uninstall) and the
+  NetworkManager `routeN=` route installation were verified on real hosts.
+- `wg-manager` declarative unattended layer: new `plan` and `reconcile` commands over a
+  desired-state spec (`apiVersion: wg-manager/v1`, JSON canonical; TOML via `tomllib`; YAML when
+  `PyYAML` is installed). `plan` is read-only and reports a pure diff (`--json`,
+  `--detailed-exitcode` returns `3` on drift); `reconcile` converges idempotently (a converged
+  server reports `changed=false` and writes nothing), supports `--prune` (tombstone, never hard
+  delete) and emits a clean JSON payload when `--json` is used. Secrets stay out of the spec via
+  `{"from_env"}`/`{"from_file"}` indirection. Also fixed: client `custom_routes` are no longer
+  advertised server-side or turned into hub FIB routes (they are reached *through* the hub), and
+  `check` reports overlapping AllowedIPs across peers.
+- `wg-manager` P1 unattended operations: read-only Prometheus exporter (`metrics`, `--format
+  json`, `--out` for a node_exporter textfile) with `wg_manager_*` gauges/counters; bulk
+  idempotent peer import (`peers --file json|ndjson|-`, `--upsert`); opt-in JSON audit lines
+  (`WG_MANAGER_LOG_FORMAT=json`); and `check` now warns when a host default-drop firewall blocks
+  hub-initiated NEW flows to peers.
 - Single error and dispatch path: handlers raise `WgError` instead of bare `SystemExit`
   (one `HANDLERS` table shared by CLI and TUI, `sweep` reachable from the menu by
   name); CLI/TUI output and exit codes unchanged.

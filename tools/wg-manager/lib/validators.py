@@ -96,6 +96,36 @@ def validate_endpoint(value):
     return s
 
 
+def normalize_endpoint(value):
+    """Split an endpoint into (host, port|None); host is returned without brackets.
+
+    Accepts hostname, IPv4, bare/bracketed IPv6 and an optional `:port` suffix.
+    Returns (str(value).strip(), None) when the value cannot be parsed, so a
+    caller can still render the raw form instead of crashing.
+    """
+    s = str(value or "").strip()
+    if not s:
+        return "", None
+    if s.startswith("["):
+        end = s.find("]")
+        if end < 0:
+            return s, None
+        host = s[1:end]
+        rest = s[end + 1:]
+        port = None
+        if rest.startswith(":"):
+            cand = rest[1:]
+            if cand.isdigit():
+                port = int(cand)
+        return host, port
+    if s.count(":") == 1:
+        left, _, right = s.partition(":")
+        if right.isdigit() and left:
+            return left, int(right)
+    # Bare IPv6 (multiple colons) or plain hostname/IPv4.
+    return s, None
+
+
 def validate_traffic(value):
     if value not in ("server-only", "custom-routes", "full-tunnel"):
         raise ValueError(t("err_invalid_traffic").format(value=value))
@@ -181,6 +211,44 @@ def validate_routes_for_role(routes, role):
         if str(route) in ("0.0.0.0/0", "::/0") and role != "infra":
             raise ValueError(t("err_route_default_role").format(route=route))
     return routes
+
+
+def find_allowed_ips_overlaps(state):
+    """Return [(name_a, name_b, net_a, net_b)] for overlapping advertised prefixes.
+
+    WireGuard assigns an overlapping prefix to whichever peer was set last and
+    the kernel installs competing FIB routes, so two peers advertising the same
+    or nested network is a silent misconfiguration worth flagging.
+    """
+    entries = []
+    for peer in state.get("peers", []) if isinstance(state, dict) else []:
+        if not isinstance(peer, dict) or peer.get("tombstoned") or not peer.get("enabled", True):
+            continue
+        name = str(peer.get("name", ""))
+        nets = []
+        for key, suffix in (("v4", 32), ("v6", 128)):
+            raw = str(peer.get(key) or "").split("/")[0].strip()
+            if not raw:
+                continue
+            try:
+                nets.append(ipaddress.ip_network(raw + "/" + str(suffix), strict=False))
+            except ValueError:
+                continue
+        if peer.get("role") == "infra":
+            for route in peer.get("custom_routes", []) or []:
+                try:
+                    nets.append(ipaddress.ip_network(str(route), strict=False))
+                except ValueError:
+                    continue
+        entries.append((name, nets))
+    out = []
+    for i in range(len(entries)):
+        for j in range(i + 1, len(entries)):
+            for net_a in entries[i][1]:
+                for net_b in entries[j][1]:
+                    if net_a.version == net_b.version and net_a.overlaps(net_b):
+                        out.append((entries[i][0], entries[j][0], str(net_a), str(net_b)))
+    return out
 
 
 def parse_set_pairs(items):

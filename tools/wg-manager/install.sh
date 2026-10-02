@@ -12,11 +12,12 @@ SUDO=0
 FORCE=0
 UNINSTALL=0
 RESTORE=0
+VERIFY=0
 DRYRUN=0
 PRIV=""
 TMP=""
 usage() {
-  printf '%s\n' "Usage: bash install.sh [options]" "  --prefix PATH  install prefix (default /usr/local, binary=PREFIX/bin/wg-manager)" "  --apply --yes --sudo  gated apply (default is dry-run, changes nothing)" "  --force  overwrite identical version; --uninstall removes binary and manifest" "  --restore  verify and reinstall the latest .bak backup of the binary" "  --dry-run  explicit dry-run; --help  show this help" "Scope: packages + binary only. Build is staged and verified before replacing the binary."
+  printf '%s\n' "Usage: bash install.sh [options]" "  --prefix PATH  install prefix (default /usr/local, binary=PREFIX/bin/wg-manager)" "  --apply --yes --sudo  gated apply (default is dry-run, changes nothing)" "  --force  overwrite identical version; --uninstall removes binary and manifest" "  --restore  verify and reinstall the latest .bak backup of the binary" "  --verify  check the installed binary against the manifest sha256" "  --dry-run  explicit dry-run; --help  show this help" "Scope: packages + binary only. Build is staged and verified before replacing the binary."
 }
 # Remove the staging file on any exit path, including INT/TERM/HUP.
 cleanup_tmp() {
@@ -76,6 +77,10 @@ while [ $# -gt 0 ]; do
       ;;
     --restore)
       RESTORE=1
+      shift
+      ;;
+    --verify)
+      VERIFY=1
       shift
       ;;
     --dry-run)
@@ -261,8 +266,76 @@ if [ "$RESTORE" -eq 1 ]; then
   $PRIV chmod 0755 "$TMP"
   $PRIV mv -f "$TMP" "$BIN"
   if [ "$SELINUX" = "yes" ] && command -v restorecon > /dev/null 2>&1; then $PRIV restorecon -v "$BIN" 2> /dev/null || true; fi
+  # Keep --verify consistent after a restore: the manifest must describe the
+  # binary now installed (zipapp builds are not byte-reproducible).
+  if [ -f "$MANIFEST" ]; then
+    REST_SHA="$(file_sha256 "$BIN")"
+    if [ -n "$REST_SHA" ]; then
+      $PRIV python3 - "$MANIFEST" "$REST_VER" "$REST_SHA" << 'PYEOF'
+import json
+import sys
+
+path, ver, sha = sys.argv[1:4]
+try:
+    with open(path, encoding="utf-8") as fh:
+        doc = json.load(fh)
+except (OSError, ValueError):
+    raise SystemExit(0)
+if isinstance(doc, dict):
+    doc["installed_version"] = ver
+    doc["binary_sha256"] = sha
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(doc, fh, indent=2, sort_keys=True)
+        fh.write("\n")
+PYEOF
+    fi
+  fi
   echo "Restored $LATEST to $BIN (version $REST_VER, self-test pass)."
   exit 0
+fi
+# Audit fix: WS-10 - read the manifest sha256 back before trusting an install.
+if [ "$VERIFY" -eq 1 ]; then
+  if [ ! -f "$MANIFEST" ]; then
+    echo "ERROR: manifest not found: $MANIFEST" >&2
+    exit 1
+  fi
+  if [ ! -x "$BIN" ]; then
+    echo "ERROR: installed binary not found or not executable: $BIN" >&2
+    exit 1
+  fi
+  if ! command -v python3 > /dev/null 2>&1; then
+    echo "ERROR: python3 not found; required to verify the manifest." >&2
+    exit 1
+  fi
+  ACTUAL_SHA="$(file_sha256 "$BIN")"
+  if [ -z "$ACTUAL_SHA" ]; then
+    echo "ERROR: no sha256 tool available (sha256sum/shasum)." >&2
+    exit 1
+  fi
+  python3 - "$MANIFEST" "$BIN" "$ACTUAL_SHA" << 'PYEOF'
+import json
+import sys
+
+manifest, bin_path, actual = sys.argv[1:4]
+try:
+    with open(manifest, encoding="utf-8") as fh:
+        doc = json.load(fh)
+except (OSError, ValueError) as exc:
+    print("ERROR: cannot read manifest: " + str(exc), file=sys.stderr)
+    raise SystemExit(1)
+if not isinstance(doc, dict):
+    print("ERROR: manifest is not a JSON object.", file=sys.stderr)
+    raise SystemExit(1)
+expected = str(doc.get("binary_sha256", ""))
+if not expected:
+    print("ERROR: manifest has no binary_sha256; cannot verify.", file=sys.stderr)
+    raise SystemExit(1)
+if expected != actual:
+    print("ERROR: binary hash mismatch (manifest " + expected + ", actual " + actual + ").", file=sys.stderr)
+    raise SystemExit(1)
+print("OK: verified " + bin_path + " against " + manifest + ".")
+PYEOF
+  exit $?
 fi
 if [ "$INST_VER" = "$SRC_VER" ] && [ "$FORCE" -eq 0 ]; then
   echo "OK: $BIN already at $SRC_VER (use --force)."

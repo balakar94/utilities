@@ -36,7 +36,22 @@ def _sp(path):
 
 
 def _manager_exe():
-    """Absolute manager binary for timer units (deterministic fallback)."""
+    """Absolute manager binary for timer units (never a bare PATH lookup).
+
+    Prefer the entrypoint actually running (the installed zipapp invoked as
+    `wg-manager`), then a PATH lookup, then a deterministic fallback. A bare
+    name would be resolved through the caller's PATH at sweep time, which is a
+    privilege-escalation vector for a root oneshot.
+    """
+    argv0 = sys.argv[0] if getattr(sys, "argv", None) else ""
+    if argv0:
+        candidate = Path(argv0)
+        if candidate.name == "wg-manager" and candidate.is_absolute():
+            try:
+                if candidate.exists() and not candidate.is_symlink():
+                    return str(candidate.resolve())
+            except OSError:
+                pass
     exe = shutil.which("wg-manager")
     if exe:
         return exe
@@ -645,6 +660,35 @@ def _post_verify(state, ifname, backend="networkd", firewall="nftables", tries=1
     return None
 
 
+def _sync_wg_peers(state, ifname):
+    """Apply peer changes to a running interface via `wg syncconf`.
+
+    `networkctl reload` and NM profile reloads do not update WireGuard peers on
+    an already-running link. Returns True when the in-kernel sync succeeded.
+    The private-key temp lives 0600 inside the state dir, never in /tmp.
+    """
+    wg = shutil.which("wg")
+    if not wg or not _verify_iface(ifname):
+        return False
+    sync_content = render_wg_syncconf(state, show_secrets=True)
+    _mkdir_private(state_dir())
+    fd, tmp_path = tempfile.mkstemp(prefix=".syncconf-", suffix=".conf", dir=str(state_dir()))
+    try:
+        try:
+            os.fchmod(fd, 0o600)
+        except OSError:
+            pass
+        with os.fdopen(fd, "w", encoding="utf-8") as tf:
+            tf.write(sync_content)
+        rc, _out, _err = _run_capture([wg, "syncconf", ifname, tmp_path])
+        return rc == 0
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+
+
 def get_wg_live_dump(ifname):
     """Query wg show <ifname> dump. Return dict: pubkey -> {endpoint, allowed_ips, handshake, rx, tx}."""
     exe = shutil.which("wg")
@@ -834,38 +878,21 @@ def apply_system_reload(state, backend, firewall, args=None):
         nmcli = shutil.which("nmcli")
         if nmcli:
             _run_best_effort([nmcli, "con", "reload"])
-            _run_best_effort([nmcli, "con", "up", "wg-manager-" + ifname])
+            # `device reapply` applies changed profile properties without a full
+            # reactivation cycle; fall back to `con up` when unsupported.
+            reapply_rc, _o, _e = _run_capture([nmcli, "device", "reapply", ifname])
+            if reapply_rc != 0:
+                _run_best_effort([nmcli, "con", "up", "wg-manager-" + ifname])
+        # Profile reload/reactivation may not push peer changes into the kernel.
+        _sync_wg_peers(state, ifname)
     else:
         nctl = shutil.which("networkctl")
         if nctl:
             _run_best_effort([nctl, "reload"])
             _run_best_effort([nctl, "reconfigure", ifname])
-        # Live kernel sync: networkctl reload does NOT update .netdev WireGuard peers on running links.
-        # If wg is available and the interface exists, sync peers in-place via wg syncconf.
-        synced = False
-        wg = shutil.which("wg")
-        if wg and _verify_iface(ifname):
-            sync_content = render_wg_syncconf(state, show_secrets=True)
-            # Keep private keys out of world-readable /tmp: write 0600 inside
-            # the state directory and unlink immediately after use.
-            _mkdir_private(state_dir())
-            fd, tmp_path = tempfile.mkstemp(prefix=".syncconf-", suffix=".conf", dir=str(state_dir()))
-            try:
-                try:
-                    os.fchmod(fd, 0o600)
-                except OSError:
-                    pass
-                with os.fdopen(fd, "w", encoding="utf-8") as tf:
-                    tf.write(sync_content)
-                rc, _out, _err = _run_capture([wg, "syncconf", ifname, tmp_path])
-                if rc == 0:
-                    synced = True
-            finally:
-                try:
-                    os.unlink(tmp_path)
-                except OSError:
-                    pass
-        if not synced:
+        # Live kernel sync: networkctl reload does NOT update .netdev WireGuard peers
+        # on running links. If wg is available, sync peers in-place via wg syncconf.
+        if not _sync_wg_peers(state, ifname):
             if not _verify_iface(ifname, tries=8, delay=0.25):
                 ctl = shutil.which("systemctl")
                 if ctl:

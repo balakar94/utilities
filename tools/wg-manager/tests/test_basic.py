@@ -573,6 +573,14 @@ def main():
             sw_svc = sysroot / "etc" / "systemd" / "system" / "wg-manager-expire.service"
             sw_tmr = sysroot / "etc" / "systemd" / "system" / "wg-manager-expire.timer"
             rec("sweep installs timer units", sw_svc.exists() and sw_tmr.exists(), "timer units missing")
+            if sw_svc.exists():
+                svc_text = sw_svc.read_text(encoding="utf-8")
+                rec("expiry service hardens the root oneshot",
+                    "NoNewPrivileges=yes" in svc_text and "ProtectHome=yes" in svc_text,
+                    "no hardening directives")
+                rec("expiry service uses an absolute ExecStart",
+                    "ExecStart=/usr/local/bin/wg-manager sweep --apply --yes" in svc_text,
+                    "ExecStart is not absolute")
             sw_nothing = run(["sweep", "--apply", "--yes"], env=init_env, cwd=tmp)
             rec("sweep no-op exits 0", sw_nothing.returncode == 0, f"rc={sw_nothing.returncode}")
 
@@ -782,6 +790,260 @@ def main():
                 _rollback_paths([(str(cfg), str(backup))])
             restored_mode = stat.S_IMODE(cfg.stat().st_mode)
             rec("rollback restores original mode", restored_mode == 0o644, f"mode={oct(restored_mode)}")
+
+        # ---------------------------------------------------------------- L5
+        # Regression layer: network renderer correctness, endpoint normalization,
+        # state trust checks and failure-injection rollback (the apply safety net
+        # is otherwise unreachable because fake binaries always exit 0).
+        if str(TOOL_ROOT) not in sys.path:
+            sys.path.insert(0, str(TOOL_ROOT))
+        from lib import renderers as _renderers
+
+        fixture = {
+            "schema_version": 1,
+            "server": {"endpoint": "vpn.example.com", "port": 51820, "mtu": 1420,
+                       "ifname": "wg0", "backend": "nm", "wan_iface": "eth0",
+                       "private_key": GOOD_KEY_A, "public_key": GOOD_KEY_B},
+            "ipv4": {"prefix": "10.90.90.0/24", "hub": "10.90.90.1"},
+            "ipv6": {"mode": "nat66", "prefix": "fd90:90:90::/64", "hub": "fd90:90:90::1", "wan_v6": ""},
+            "pools_v4": [], "pools_v6": [],
+            "peers": [{"name": "br", "role": "infra", "kind": "permanent", "infra_type": "router",
+                       "pubkey": GOOD_KEY_B, "privkey": GOOD_KEY_A, "v4": "10.90.90.10", "v6": "fd90:90:90::10",
+                       "enabled": True, "tombstoned": False, "traffic": "server-only",
+                       "custom_routes": ["192.168.5.0/24", "fd00:5::/64"]}],
+        }
+        nm_out = _renderers.render_nm(fixture, show_secrets=True)
+        rec("nm route uses keyfile comma syntax",
+            "route1=192.168.5.0/24,10.90.90.10" in nm_out, "route syntax wrong")
+        rec("nm does not emit legacy routes= list", "routes=" not in nm_out, "legacy routes= emitted")
+        rec("nm ipv6 route lives in [ipv6]",
+            "route1=fd00:5::/64,fd90:90:90::10" in nm_out.split("[ipv6]", 1)[-1], "v6 route family wrong")
+        net_out = _renderers.render_network(fixture)
+        rec("network ipv6 route uses ipv6 gateway",
+            "Destination=fd00:5::/64\nGateway=fd90:90:90::10" in net_out, "v6 gateway wrong")
+        rec("network ipv4 route uses ipv4 gateway",
+            "Destination=192.168.5.0/24\nGateway=10.90.90.10" in net_out, "v4 gateway wrong")
+
+        ep_hostname_port = dict(fixture)
+        ep_hostname_port["server"] = dict(fixture["server"], endpoint="vpn.example.com:51821")
+        wq = _renderers.render_wgquick(ep_hostname_port, fixture["peers"][0], show_secrets=True)
+        rec("endpoint host:port keeps embedded port",
+            "Endpoint = vpn.example.com:51821" in wq, "embedded port lost")
+        rec("hostname endpoint is not bracketed", "[vpn.example.com" not in wq, "hostname bracketed")
+        ep_v6 = dict(fixture)
+        ep_v6["server"] = dict(fixture["server"], endpoint="[2001:db8::1]")
+        wq6 = _renderers.render_wgquick(ep_v6, fixture["peers"][0], show_secrets=True)
+        rec("ipv6 endpoint is bracketed once",
+            "Endpoint = [2001:db8::1]:51820" in wq6, "ipv6 endpoint wrong")
+        rsc_out = _renderers.render_rsc(ep_hostname_port, fixture["peers"][0], show_secrets=True)
+        rec("rsc endpoint split host/port",
+            'endpoint-address="vpn.example.com" endpoint-port=51821' in rsc_out, "rsc endpoint not split")
+
+        # N4: a client's custom_routes are reached THROUGH the hub; they must not
+        # be advertised server-side nor create a hub FIB route back to the client.
+        client_state = dict(fixture)
+        client_state["peers"] = [{"name": "cl", "role": "client", "kind": "ondemand",
+                                  "pubkey": GOOD_KEY_A, "privkey": GOOD_KEY_B, "psk": GOOD_KEY_B,
+                                  "v4": "10.90.90.30", "enabled": True, "tombstoned": False,
+                                  "traffic": "custom-routes", "custom_routes": ["172.16.9.0/24"]}]
+        cl_nm = _renderers.render_nm(client_state, show_secrets=True)
+        cl_section = cl_nm.split("[wireguard-peer." + GOOD_KEY_A + "]", 1)[-1].split("[", 1)[0]
+        rec("client custom-routes not advertised server-side", "172.16.9.0/24" not in cl_section, "route advertised on server")
+        rec("client custom-routes absent from hub FIB routes", "172.16.9.0/24" not in _renderers.render_network(client_state), "hub route created")
+        cl_wq = _renderers.render_wgquick(client_state, client_state["peers"][0], show_secrets=True)
+        rec("client still tunnels its custom-routes", "172.16.9.0/24" in cl_wq, "client route lost")
+
+        # N8: overlapping advertised prefixes across peers are reported.
+        from lib.validators import find_allowed_ips_overlaps
+        overlap_state = {"peers": [
+            {"name": "r1", "role": "infra", "enabled": True, "v4": "10.90.90.10", "custom_routes": ["10.10.0.0/24"]},
+            {"name": "r2", "role": "infra", "enabled": True, "v4": "10.90.90.11", "custom_routes": ["10.10.0.128/25"]},
+        ]}
+        overlaps = find_allowed_ips_overlaps(overlap_state)
+        rec("overlapping AllowedIPs detected", len(overlaps) == 1, f"overlaps={overlaps}")
+
+        # State trust: a symlinked state file is rejected (not followed).
+        with tempfile.TemporaryDirectory() as tmp:
+            real_state = Path(tmp) / "real.json"
+            seed_state(real_state)
+            link_state = Path(tmp) / "link.json"
+            link_state.symlink_to(real_state)
+            sym = run(["list"], env={"WG_MANAGER_STATE": str(link_state)}, cwd=tmp)
+            rec("symlinked state rejected", sym.returncode == 1 and "Traceback" not in (sym.stdout + sym.stderr),
+                f"rc={sym.returncode}")
+            forbidden = run(["list"], env={"WG_MANAGER_STATE": "/state.json"}, cwd=tmp)
+            rec("state in a system parent rejected", forbidden.returncode == 1 and "Traceback" not in (forbidden.stdout + forbidden.stderr),
+                f"rc={forbidden.returncode}")
+
+        # Failure injection: an injected post-verify failure must roll the file
+        # set back and never claim success (the offline SYSROOT verifier would
+        # otherwise pass on mere file existence).
+        with tempfile.TemporaryDirectory() as tmp:
+            import lib.state as _statemod
+            import lib.system as _sysmod
+            sysroot = Path(tmp) / "sysroot"
+            fstate = Path(tmp) / "statedir" / "state.json"
+            seeded = seed_state(fstate)
+            seeded["server"]["private_key"] = GOOD_KEY_A
+            seeded["server"]["public_key"] = GOOD_KEY_B
+            fstate.write_text(json.dumps(seeded, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+            os.environ["WG_MANAGER_STATE"] = str(fstate)
+            saved = {
+                "SYSROOT": _sysmod.SYSROOT,
+                "_post_verify": _sysmod._post_verify,
+                "which": _sysmod.shutil.which,
+                "_precheck_backend": _sysmod._precheck_backend,
+                "_precheck_firewall": _sysmod._precheck_firewall,
+            }
+            _sysmod.SYSROOT = str(sysroot)
+            _sysmod.shutil.which = lambda *a, **k: None
+            _sysmod._post_verify = lambda *a, **k: "injected failure"
+            _sysmod._precheck_backend = lambda *a, **k: None
+            _sysmod._precheck_firewall = lambda *a, **k: None
+            try:
+                injected_state = _statemod.load_state()
+                netdev_path = Path(_sysmod._sp("/etc/systemd/network/90-wg0.netdev"))
+                netdev_path.parent.mkdir(parents=True, exist_ok=True)
+                netdev_path.write_text("original-netdev", encoding="utf-8")
+                applied = _sysmod.apply_system_reload(injected_state, "networkd", "nft", None)
+                rec("injected post-verify returns failure", applied is False, f"applied={applied}")
+                rec("injected post-verify restores netdev",
+                    netdev_path.exists() and netdev_path.read_text(encoding="utf-8") == "original-netdev",
+                    "netdev not restored")
+                rec("injected post-verify removes new sysctl",
+                    not Path(_sysmod._sp("/etc/sysctl.d/90-wg-manager.conf")).exists(), "sysctl left behind")
+            finally:
+                _sysmod.SYSROOT = saved["SYSROOT"]
+                _sysmod._post_verify = saved["_post_verify"]
+                _sysmod.shutil.which = saved["which"]
+                _sysmod._precheck_backend = saved["_precheck_backend"]
+                _sysmod._precheck_firewall = saved["_precheck_firewall"]
+                os.environ.pop("WG_MANAGER_STATE", None)
+
+        # Declarative layer: spec normalization, pure plan/diff and idempotent
+        # reconcile under SYSROOT (apply twice must converge to no changes).
+        from lib.reconcile import compute_plan
+        from lib.spec import normalize_spec
+        desired_doc = {
+            "apiVersion": "wg-manager/v1",
+            "server": {"endpoint": "vpn.example.com", "port": 51820, "mtu": 1420, "ifname": "wg0",
+                       "backend": "networkd", "wan_iface": "eth0"},
+            "ipv4": {"prefix": "10.90.90.0/24", "hub": "10.90.90.1"},
+            "ipv6": {"mode": "disabled"},
+            "pools": {"v4": [{"name": "clients", "range": "10.90.90.21-10.90.90.150", "kind": "next-free"}]},
+            "peers": [{"name": "phone", "role": "client", "traffic": "full-tunnel", "psk": {"from_env": "WGM_TEST_PSK"}}],
+        }
+        desired = normalize_spec(desired_doc)
+        rec("spec normalizes apiVersion", desired["apiVersion"] == "wg-manager/v1", "api gone")
+        empty_state = {"server": {}, "ipv4": {}, "ipv6": {}, "pools_v4": [], "pools_v6": [], "peers": []}
+        plan_add = compute_plan(empty_state, desired)
+        rec("plan detects peer add", any(c["action"] == "add" and c["name"] == "phone" for c in plan_add), f"plan={plan_add}")
+        rec("plan is deterministic", compute_plan(empty_state, desired) == plan_add, "plan differs")
+        converged = {"server": dict(desired["server"]), "ipv4": dict(desired["ipv4"]),
+                     "ipv6": {"mode": "disabled"}, "pools_v4": [dict(p) for p in desired["pools"]["v4"]],
+                     "pools_v6": [],
+                     "peers": [{"name": "phone", "role": "client", "traffic": "full-tunnel", "psk": "x",
+                                "enabled": True, "tombstoned": False}]}
+        rec("plan empty when converged", compute_plan(converged, desired) == [], "spurious changes")
+        bad_spec = {"apiVersion": "wg-manager/v2", "server": {}, "peers": []}
+        try:
+            normalize_spec(bad_spec)
+            rec("spec rejects unknown apiVersion", False, "accepted")
+        except ValueError:
+            rec("spec rejects unknown apiVersion", True, "rejected")
+
+        with tempfile.TemporaryDirectory() as ptmp:
+            spec_path = Path(ptmp) / "desired.json"
+            spec_path.write_text(json.dumps(desired_doc), encoding="utf-8")
+            pl = run(["plan", "--config", str(spec_path), "--json"],
+                     env={"WG_MANAGER_STATE": str(Path(ptmp) / "nostate.json"), "WGM_TEST_PSK": GOOD_KEY_A}, cwd=ptmp)
+        try:
+            pl_payload = json.loads(pl.stdout)
+            rec("plan --json is valid JSON", isinstance(pl_payload, dict), "not a dict")
+            rec("plan --json reports changed", pl_payload.get("changed") is True, f"payload={pl_payload.get('changed')}")
+        except (ValueError, TypeError) as exc:
+            rec("plan --json is valid JSON", False, str(exc))
+            rec("plan --json reports changed", False, "unparseable")
+        rec("plan is read-only", pl.returncode == 0, f"rc={pl.returncode}")
+
+        # Self-contained sandboxed reconcile block (fake binaries + SYSROOT).
+        with tempfile.TemporaryDirectory() as rtmp:
+            rbindir, _rlog = fake_bin_dir(rtmp)
+            rsysroot = Path(rtmp) / "sysroot"
+            spec2 = Path(rtmp) / "desired.json"
+            spec2.write_text(json.dumps(desired_doc), encoding="utf-8")
+            rec_state = Path(rtmp) / "statedir" / "state.json"
+            rec_env = fake_env(rtmp, rbindir, rec_state, rsysroot)
+            rec_env["WGM_TEST_PSK"] = GOOD_KEY_A
+            # Seed the state in place (reconcile is update-in-place, not bootstrap).
+            seed_state(rec_state)
+            seeded = json.loads(rec_state.read_text(encoding="utf-8"))
+            seeded["server"]["private_key"] = GOOD_KEY_A
+            seeded["server"]["public_key"] = GOOD_KEY_B
+            rec_state.write_text(json.dumps(seeded, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+            r1 = run(["reconcile", "--config", str(spec2), "--apply", "--yes", "--json"], env=rec_env, cwd=rtmp)
+            rec("reconcile --apply exits 0", r1.returncode == 0, f"rc={r1.returncode} err={(r1.stdout + r1.stderr)[-160:]}")
+            rec("reconcile writes state", rec_state.exists(), "no state")
+            if rec_state.exists():
+                st = json.loads(rec_state.read_text(encoding="utf-8"))
+                rec("reconcile persisted peer", any(p.get("name") == "phone" for p in st.get("peers", [])), "peer missing")
+            r2 = run(["reconcile", "--config", str(spec2), "--apply", "--yes", "--json"], env=rec_env, cwd=rtmp)
+            try:
+                r2_payload = json.loads(r2.stdout)
+                rec("reconcile is idempotent", r2_payload.get("changed") is False, f"changed={r2_payload.get('changed')}")
+            except (ValueError, TypeError) as exc:
+                rec("reconcile is idempotent", False, str(exc))
+            pl2 = run(["plan", "--config", str(spec2), "--json", "--detailed-exitcode"], env=rec_env, cwd=rtmp)
+            rec("converged plan exits 0", pl2.returncode == 0, f"rc={pl2.returncode}")
+            drift_doc = json.loads(json.dumps(desired_doc))
+            drift_doc["server"]["endpoint"] = "changed.example.com"
+            drift_path = Path(rtmp) / "drift.json"
+            drift_path.write_text(json.dumps(drift_doc), encoding="utf-8")
+            pl3 = run(["plan", "--config", str(drift_path), "--json", "--detailed-exitcode"], env=rec_env, cwd=rtmp)
+            rec("drift plan exits 3", pl3.returncode == 3, f"rc={pl3.returncode}")
+            r3 = run(["reconcile", "--config", str(spec2), "--apply", "--yes", "--json"], env=rec_env, cwd=rtmp)
+            try:
+                r3_payload = json.loads(r3.stdout)
+                rec("second reconcile is a true no-op",
+                    r3_payload.get("summary", {}).get("update") == 0
+                    and r3_payload.get("summary", {}).get("add") == 0, f"summary={r3_payload.get('summary')}")
+            except (ValueError, TypeError) as exc:
+                rec("second reconcile is a true no-op", False, str(exc))
+
+            # P1: Prometheus metrics are valid text with stable metric names.
+            met = run(["metrics"], env=rec_env, cwd=rtmp)
+            rec("metrics exits 0", met.returncode == 0, f"rc={met.returncode}")
+            rec("metrics emits prometheus names", "wg_manager_peers_total" in met.stdout and "# TYPE" in met.stdout,
+                "missing metric names")
+            met_json = run(["metrics", "--format", "json"], env=rec_env, cwd=rtmp)
+            try:
+                met_payload = json.loads(met_json.stdout)
+                rec("metrics --format json is valid", isinstance(met_payload, dict) and "metrics" in met_payload, "bad payload")
+            except (ValueError, TypeError) as exc:
+                rec("metrics --format json is valid", False, str(exc))
+
+            # P1: bulk peer import (json + ndjson), idempotent with --upsert.
+            import_doc = Path(rtmp) / "peers.json"
+            import_doc.write_text(json.dumps([
+                {"name": "bulk1", "role": "client", "traffic": "server-only", "no_psk": True},
+                {"name": "bulk2", "role": "client", "traffic": "server-only", "no_psk": True},
+            ]), encoding="utf-8")
+            imp = run(["peers", "--file", str(import_doc), "--apply", "--yes"],
+                      env=rec_env, cwd=rtmp)
+            rec("peers import exits 0", imp.returncode == 0, f"rc={imp.returncode} err={(imp.stdout + imp.stderr)[-160:]}")
+            st_imp = json.loads(rec_state.read_text(encoding="utf-8"))
+            rec("peers import persisted", {"bulk1", "bulk2"} <= {p.get("name") for p in st_imp.get("peers", [])}, "peers missing")
+            imp_dup = run(["peers", "--file", str(import_doc), "--apply", "--yes"],
+                          env=rec_env, cwd=rtmp)
+            rec("peers import refuses duplicates", imp_dup.returncode == 1, f"rc={imp_dup.returncode}")
+            imp_up = run(["peers", "--file", str(import_doc), "--upsert", "--apply", "--yes"],
+                         env=rec_env, cwd=rtmp)
+            rec("peers import --upsert exits 0", imp_up.returncode == 0, f"rc={imp_up.returncode}")
+
+            # N6: hub->peer NEW warning is exposed as a check row (pure helper path).
+            n6_state = {"server": {"port": 51820}, "peers": []}
+            preview = preview_system_uninstall(n6_state)
+            rec("uninstall preview still lists nftables", any("nftables" in p[0] for p in preview), "preview drift")
 
         # i18n key parity across en/es/de.
         try:

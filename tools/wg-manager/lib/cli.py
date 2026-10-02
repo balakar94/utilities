@@ -1,5 +1,7 @@
 # cli.py
 import argparse
+import os
+import shutil
 import sys
 
 from .commands import HANDLERS
@@ -113,6 +115,26 @@ SUBCOMMAND_SPEC = {
     ),
     "uninstall": (),
     "sweep": (),
+    "plan": (
+        ("--config", {"default": ""}),
+        ("--json", {"action": "store_true"}),
+        ("--prune", {"action": "store_true"}),
+        ("--detailed-exitcode", {"action": "store_true"}),
+    ),
+    "reconcile": (
+        ("--config", {"default": ""}),
+        ("--json", {"action": "store_true"}),
+        ("--prune", {"action": "store_true"}),
+    ),
+    "metrics": (
+        ("--format", {"default": "prometheus", "choices": ["prometheus", "json"]}),
+        ("--out", {"default": ""}),
+    ),
+    "peers": (
+        ("--file", {"default": ""}),
+        ("--format", {"default": "auto", "choices": ["auto", "json", "ndjson"]}),
+        ("--upsert", {"action": "store_true"}),
+    ),
 }
 
 
@@ -211,6 +233,19 @@ def main(argv=None):
     if not cmd:
         eprint(usage())
         return 2
+    # --sudo must re-execute before any handler reads the state directory:
+    # `/etc/wg-manager` is root-owned 0700, so a non-root caller cannot even
+    # stat state.json. require_apply() ran too late for read-first commands.
+    if getattr(args, "sudo", False):
+        try:
+            euid = os.geteuid()
+        except AttributeError:
+            euid = 0
+        if euid != 0:
+            sudo = shutil.which("sudo")
+            entry = os.path.abspath(sys.argv[0] or "")
+            if sudo and entry and os.path.exists(entry):
+                os.execvp(sudo, [sudo, sys.executable, entry] + sys.argv[1:])
     func = _HANDLERS.get(cmd)
     if func is None:
         eprint(t("err_unknown_cmd").format(cmd=cmd))

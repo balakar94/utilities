@@ -222,6 +222,13 @@ def cmd_self_test(_args=None):
                 {"name": "c1", "role": "client", "kind": "ondemand", "v4": "10.90.90.2", "v6": "", "tombstoned": False},
             ]
             state_file.write_text(json.dumps(fixture), encoding="utf-8")
+            # The state-trust check (root) requires 0600; keep the fixture valid
+            # so --self-test passes both as a normal user and when install.sh
+            # verifies the staged zipapp as root.
+            try:
+                os.chmod(state_file, 0o600)
+            except OSError:
+                pass
             old_state = os.environ.get("WG_MANAGER_STATE")
             os.environ["WG_MANAGER_STATE"] = str(state_file)
             try:
@@ -405,6 +412,98 @@ def cmd_self_test(_args=None):
             fail("rendered nft contains a default drop policy")
     except (ValueError, KeyError) as exc:
         fail("key/render/nft checks raised: " + str(exc))
+    # 15b. Endpoint normalization, NetworkManager route keyfile shape and
+    # state-path/SYSROOT guards (regressions of the unattended hardening).
+    try:
+        from .constants import _resolve_sysroot
+        from .state import state_path
+        from .validators import normalize_endpoint
+        if normalize_endpoint("vpn.example.com:51821") != ("vpn.example.com", 51821):
+            fail("normalize_endpoint host:port failed")
+        if normalize_endpoint("[2001:db8::1]:51820") != ("2001:db8::1", 51820):
+            fail("normalize_endpoint bracketed v6 failed")
+        if normalize_endpoint("[2001:db8::1]") != ("2001:db8::1", None):
+            fail("normalize_endpoint bare bracketed v6 failed")
+        if normalize_endpoint("vpn.example.com") != ("vpn.example.com", None):
+            fail("normalize_endpoint hostname failed")
+        ep_state = default_state()
+        ep_state["server"]["private_key"] = good
+        ep_state["server"]["public_key"] = good
+        ep_state["server"]["endpoint"] = "vpn.example.com:51821"
+        ep_peer = {"name": "c", "role": "client", "traffic": "server-only",
+                   "privkey": good, "pubkey": good, "v4": "10.90.90.2", "keepalive": 25}
+        ep_out = render_wgquick(ep_state, ep_peer, show_secrets=True)
+        if "Endpoint = vpn.example.com:51821" not in ep_out or "[vpn.example.com" in ep_out:
+            fail("endpoint host:port render failed")
+        nm_state = default_state()
+        nm_state["server"]["private_key"] = good
+        nm_state["server"]["public_key"] = good
+        nm_state["peers"] = [{"name": "br", "role": "infra", "kind": "permanent", "pubkey": good,
+                              "privkey": good, "v4": "10.90.90.10", "v6": "", "enabled": True,
+                              "tombstoned": False, "custom_routes": ["192.168.5.0/24"]}]
+        nm_out = render_nm(nm_state, show_secrets=True)
+        if "route1=192.168.5.0/24,10.90.90.10" not in nm_out or "routes=" in nm_out:
+            fail("nm route keyfile shape failed")
+        if _resolve_sysroot("relative/path") != "" or _resolve_sysroot("/") != "":
+            fail("SYSROOT sanitization failed")
+        if _resolve_sysroot("/tmp/wgm-sysroot") != "/tmp/wgm-sysroot":
+            fail("SYSROOT absolute passthrough failed")
+        saved_state_env = os.environ.get("WG_MANAGER_STATE")
+        os.environ["WG_MANAGER_STATE"] = "/state.json"
+        try:
+            try:
+                state_path()
+                fail("state_path accepted a system parent")
+            except ValueError:
+                pass
+        finally:
+            if saved_state_env is None:
+                os.environ.pop("WG_MANAGER_STATE", None)
+            else:
+                os.environ["WG_MANAGER_STATE"] = saved_state_env
+    except (ValueError, KeyError, ImportError) as exc:
+        fail("unattended hardening checks raised: " + str(exc))
+    # 15c. Declarative layer: spec normalization and pure plan diff.
+    try:
+        from .reconcile import compute_plan, plan_summary
+        from .spec import SPEC_API, normalize_spec
+        spec_doc = {
+            "apiVersion": SPEC_API,
+            "server": {"endpoint": "vpn.example.com", "port": 51820, "mtu": 1420, "ifname": "wg0",
+                       "backend": "networkd", "wan_iface": "eth0"},
+            "peers": [{"name": "phone", "role": "client", "traffic": "full-tunnel"}],
+        }
+        desired = normalize_spec(spec_doc)
+        if desired["apiVersion"] != SPEC_API or not desired["peers"]:
+            fail("spec normalize dropped fields")
+        empty = {"server": {}, "ipv4": {}, "ipv6": {}, "pools_v4": [], "pools_v6": [], "peers": []}
+        changes = compute_plan(empty, desired)
+        if not any(c["action"] == "add" and c["name"] == "phone" for c in changes):
+            fail("plan missed peer add")
+        if plan_summary(changes) != {"add": 1, "update": len(changes) - 1, "delete": 0}:
+            fail("plan summary counts wrong")
+        try:
+            normalize_spec({"apiVersion": "wg-manager/v9"})
+            fail("spec accepted unknown apiVersion")
+        except ValueError:
+            pass
+    except (ValueError, KeyError, ImportError) as exc:
+        fail("declarative checks raised: " + str(exc))
+    # 15d. Metrics and log-format helpers (offline, pure).
+    try:
+        from .metrics import collect_metrics, render_prometheus
+        met_state = default_state()
+        met_state["peers"] = [{"name": "p1", "role": "client", "v4": "10.90.90.2",
+                               "pubkey": good, "enabled": True, "tombstoned": False}]
+        import time as _t
+        samples = collect_metrics(met_state, now=int(_t.time()))
+        text = render_prometheus(samples)
+        if "wg_manager_peers_total" not in text or "# TYPE" not in text:
+            fail("metrics exposition malformed")
+        if 'wg_manager_peer_enabled{peer="p1"} 1' not in text:
+            fail("metrics per-peer sample missing")
+    except (ValueError, KeyError, ImportError) as exc:
+        fail("metrics checks raised: " + str(exc))
     # 16. Init collector round-trip: replaying collected answers via --set
     # must reproduce the identical proposal (TUI single-pass fidelity).
     try:

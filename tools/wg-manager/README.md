@@ -32,7 +32,8 @@ Owner: `@balakar94` | Last-verified: `2026-09-24` | Status: `incubating` | Licen
   `/etc/nftables.d/90-wg-manager.nft`, and `/etc/nftables.conf` (or `/etc/sysconfig/nftables.conf` on
   RHEL). Also applies live sysctl values, firewall rules, and the WireGuard interface.
 - `install.sh --apply` installs distro packages and the zipapp under the chosen `--prefix`
-  (default `/usr/local`).
+  (default `/usr/local`); `install.sh --verify` re-checks the installed binary against the manifest
+  `binary_sha256`.
 - Real backups live under the state dir (`/etc/wg-manager/backups/`), never `/var/backups/`: `state-*`,
   `sys-*`, and `manual-*` each keep the latest 20; `audit.log` rotates to `audit.log.1` above 1 MiB.
 - Rollback: `rollback --to <snapshot>` restores state and re-applies the network configuration;
@@ -56,8 +57,72 @@ Expected: installer plan, then `SELF-TEST PASS`, then a dry-run preview; exit `0
 All commands are dry-run by default; `--apply --yes [--sudo]` commits changes, and `--dry-run` always wins
 over `--apply`. `list`, `check`, and `status` accept `--json`.
 
-### Interactive Console & Setup
+### Metrics & Bulk Operations
 
+- `metrics`: Read-only Prometheus exporter. Renders `wg_manager_*` gauges/counters
+  (`interface_present`, `peers_total`, `peers_active`, `peers_online`,
+  `peers_expiring_7d`, per-peer `handshake_age_seconds`, `rx/tx_bytes_total`,
+  `enabled`, `expired`) plus `--format json`. `--out FILE` writes the textfile
+  (atomically, `0644`) for a node_exporter textfile collector; no daemon listens.
+
+  ```bash
+  wg-manager metrics
+  wg-manager metrics --out /var/lib/node_exporter/textfile/wg_manager.prom
+  ```
+
+- `peers`: Bulk, idempotent peer import from JSON, NDJSON or stdin (`--file`, `--format
+  auto|json|ndjson`, `--upsert`). Same validation and secret rules as `add`/the spec.
+
+  ```bash
+  wg-manager peers --file peers.json --apply --yes --sudo
+  printf '%s\n' '{"name":"vpn1","role":"client"}' | wg-manager peers --file - --format ndjson
+  ```
+
+- Structured audit logs: set `WG_MANAGER_LOG_FORMAT=json` to make `audit.log` emit one
+  JSON object per line (`ts, level, action, detail, user, pid`). Default stays text.
+
+### Declarative (unattended) Configuration
+
+- `plan`: Read a desired-state spec and print the changes needed to converge,
+  without writing anything. `--json` prints `{apiVersion, changed, summary, changes[]}`
+  and `--detailed-exitcode` returns `3` when there is drift (`0` when converged).
+- `reconcile`: Apply the spec. Idempotent: a converged server reports
+  `changed=false` and performs no state write. `--prune` tombstones peers absent
+  from the spec (never a hard delete). `--json` prints a machine-readable plan/result
+  on stdout; human apply chatter goes to stderr.
+
+  ```bash
+  wg-manager plan --config desired.json --json --detailed-exitcode
+  wg-manager reconcile --config desired.json --apply --yes --sudo --json
+  wg-manager reconcile --config desired.json --apply --yes --sudo --prune
+  ```
+
+- Spec format: JSON (canonical), TOML via `tomllib`, or YAML when `PyYAML` is installed.
+  `apiVersion` is `wg-manager/v1`; unknown versions are rejected. The document covers
+  `server`, `ipv4`, `ipv6`, `pools` (`v4`/`v6`) and `peers`.
+
+  ```json
+  {
+    "apiVersion": "wg-manager/v1",
+    "server": {"endpoint": "vpn.example.com", "port": 51820, "mtu": 1420,
+               "ifname": "wg0", "backend": "networkd", "wan_iface": "eth0"},
+    "ipv4": {"prefix": "10.90.90.0/24", "hub": "10.90.90.1"},
+    "ipv6": {"mode": "disabled"},
+    "pools": {"v4": [{"name": "clients", "range": "10.90.90.21-10.90.90.150", "kind": "next-free"}]},
+    "peers": [
+      {"name": "phone", "role": "client", "traffic": "full-tunnel",
+       "psk": {"from_env": "WGM_PHONE_PSK"}},
+      {"name": "branch", "role": "infra", "infra_type": "router",
+       "ip": "10.90.90.10", "custom_routes": ["192.168.50.0/24"]}
+    ]
+  }
+  ```
+
+- Secrets are never inline in the spec: `psk` accepts `"generate"`, a literal key, or an
+  indirection object `{"from_env": "NAME"}` / `{"from_file": "/run/secrets/x"}`. A spec has
+  no server private key; `init` keeps owning the key material.
+
+### Interactive Console & Setup
 - `menu`: Full-screen TUI cockpit with live status, telemetry, and a peers preview. Starts in DRY-RUN;
   press `A` to toggle `MODE: APPLY`. In APPLY, `delete`, `purge`, and `rollback` require typing the exact
   action word, and the first run asks before writing. Select items by number (`1`..`17`, `0` exits), by
@@ -319,6 +384,7 @@ over `--apply`. `list`, `check`, and `status` accept `--json`.
 | `0` | Success. |
 | `1` | Execution or state failure (`check` also returns `1` when a check reports `err`). |
 | `2` | Usage error (bad flags, missing `--yes`, incomplete non-interactive `init`). |
+| `3` | Drift detected (`plan --detailed-exitcode` only). |
 | `130` | Interrupted (Ctrl-C). |
 
 ## Troubleshooting
@@ -357,6 +423,18 @@ RHEL-family hosts may need EPEL for `wireguard-tools`.
   on the same host (same threat model as the `0600` files), while a lost external key would make
   disaster recovery impossible. If you need it, wrap `<state_dir>/backups` with LUKS/host-level
   encryption; a future `age`-based opt-in needs an external KMS/TPM design first.
+- Unattended hardening: the state file must be a regular, root-owned `0600` file and symlinks are
+  rejected; a non-root caller keeps the historical behaviour. The state path may not sit directly in
+  a system directory (`/etc`, `/var`, ...). The daily expiry timer runs with `NoNewPrivileges=yes`,
+  `ProtectHome=yes`, `PrivateTmp=yes` and an absolute `ExecStart`, so it never resolves the binary
+  through `PATH` at sweep time.
+- `systemd-networkd` reads the `.netdev` as the `systemd-network` user, so it is written `0640`
+  `root:systemd-network`: forcing `0600` makes networkd skip the interface (verified on systemd 255).
+  The server private key and peer pre-shared keys are therefore readable by that service group; for
+  the NetworkManager backend the keyfile stays `0600`.
+- `--sudo` re-executes the real entrypoint **before** any handler reads state, so a non-root operator
+  can use it even though `/etc/wg-manager` is `0700 root`; without it, a non-root read fails with an
+  actionable message instead of a traceback.
 
 ## Limits & status
 
