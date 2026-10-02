@@ -2,7 +2,7 @@
 
 > Guided native WireGuard server manager for Debian, RHEL, Fedora and Arch operators.
 
-Owner: `@balakar94` | Last-verified: `2026-09-24` | Status: `incubating` | License: `Apache-2.0`
+Owner: `@balakar94` | Last-verified: `2026-10-02` | Status: `incubating` | License: `Apache-2.0`
 
 ## Use for
 
@@ -19,7 +19,8 @@ Owner: `@balakar94` | Last-verified: `2026-09-24` | Status: `incubating` | Licen
 - `python >= 3.11` stdlib only; `bash` for `install.sh`.
 - `wireguard-tools` (`wg`) for keys; one of `nftables`, `firewalld`, or `ufw`; `qrencode` optional.
 - `WG_MANAGER_STATE` overrides the state path; `WG_MANAGER_SYSROOT` is a test-only seam that redirects
-  system paths. `--lang auto|en|es|de`; dry-run and `--self-test` need no network.
+  system paths, and `WG_MANAGER_LOG_FORMAT=json` switches `audit.log` to one JSON object per line.
+  `--lang auto|en|es|de`; dry-run and `--self-test` need no network.
 
 ## Impact
 
@@ -55,7 +56,7 @@ Expected: installer plan, then `SELF-TEST PASS`, then a dry-run preview; exit `0
 ## Commands reference
 
 All commands are dry-run by default; `--apply --yes [--sudo]` commits changes, and `--dry-run` always wins
-over `--apply`. `list`, `check`, and `status` accept `--json`.
+over `--apply`. `list`, `check`, `status`, and `plan` accept `--json`; `metrics` accepts `--format json`.
 
 ### Metrics & Bulk Operations
 
@@ -440,6 +441,9 @@ RHEL-family hosts may need EPEL for `wireguard-tools`.
 
 - CI is offline; live handshakes and kernel applies need staging VMs or hosts.
 - Changing the IPv6 mode or prefixes invalidates addresses; regenerate every QR and router file.
+- `plan`/`reconcile` are update-in-place: bootstrap a host once with `init`, then keep it converged
+  from the spec. Reading the root-owned `0700` state needs root or `--sudo` (no non-root state read).
+- `metrics` is best-effort offline (`wg show` absent returns zeroed per-peer series).
 
 ## License & credits
 
