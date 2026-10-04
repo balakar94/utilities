@@ -17,6 +17,7 @@ from .i18n import (
 from .ipam import IPAMError
 from .presentation import eprint, usage
 from .selftest import cmd_self_test
+from .state import peek_saved_lang
 from .tui import cmd_menu
 
 # Frontend dispatch extends the canonical table in lib.commands: "menu" is the
@@ -166,6 +167,34 @@ def build_parser():
     return parser
 
 
+def _resolve_runtime_lang(user_lang):
+    """Language precedence: explicit --lang > WG_MANAGER_LANG > saved state.
+
+    Falls back to auto-detect (TTY menu when the locale is ambiguous).
+    The saved state matters because sudo often strips the environment on
+    re-exec, while the state file survives.
+    """
+    if (user_lang or "auto") != "auto":
+        set_language(user_lang)
+        return
+    env_lang = os.environ.get("WG_MANAGER_LANG", "").strip().lower()
+    if env_lang in ("en", "es", "de"):
+        set_language(env_lang)
+        return
+    try:
+        saved = peek_saved_lang()
+    except Exception:
+        saved = None
+    if saved is not None:
+        set_language(saved)
+        return
+    try:
+        is_tty = sys.stdin.isatty() and sys.stdout.isatty()
+    except (OSError, ValueError):
+        is_tty = False
+    resolve_auto_lang(is_tty)
+
+
 def _resolve_lang_for_self_test(rest):
     """Resolve --lang for the offline self-test without ever prompting."""
     for idx, token in enumerate(rest):
@@ -202,7 +231,7 @@ def main(argv=None):
             set_language(detect_system_lang())
             eprint(usage())
             return 2
-        resolve_auto_lang(True)
+        _resolve_runtime_lang("auto")
         args = argparse.Namespace(lang=current_lang(), color="auto", no_color=False,
                                   width=0, apply=False, yes=False, sudo=False,
                                   dry_run=False, show_secrets=False)
@@ -214,14 +243,7 @@ def main(argv=None):
         # argparse exits 0 for --help and 2 on usage errors; preserve both.
         return int(exc.code) if exc.code is not None else 2
     user_lang = getattr(args, "lang", "auto") or "auto"
-    if user_lang == "auto":
-        try:
-            is_tty = sys.stdin.isatty() and sys.stdout.isatty()
-        except (OSError, ValueError):
-            is_tty = False
-        resolve_auto_lang(is_tty)
-    else:
-        set_language(user_lang)
+    _resolve_runtime_lang(user_lang)
     if getattr(args, "version", False):
         print(PROG + " " + VERSION)
         return 0

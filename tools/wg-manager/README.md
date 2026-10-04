@@ -20,7 +20,9 @@ Owner: `@balakar94` | Last-verified: `2026-10-02` | Status: `incubating` | Licen
 - `wireguard-tools` (`wg`) for keys; one of `nftables`, `firewalld`, or `ufw`; `qrencode` optional.
 - `WG_MANAGER_STATE` overrides the state path; `WG_MANAGER_SYSROOT` is a test-only seam that redirects
   system paths, and `WG_MANAGER_LOG_FORMAT=json` switches `audit.log` to one JSON object per line.
-  `--lang auto|en|es|de`; dry-run and `--self-test` need no network.
+  `WG_MANAGER_LANG=en|es|de` pins the UI language without passing `--lang` (handy when root's
+  locale is `C`); otherwise `init` stores your answered language in the state file and later
+  commands reuse it. `--lang auto|en|es|de`; dry-run and `--self-test` need no network.
 
 ## Impact
 
@@ -339,7 +341,10 @@ over `--apply`. `list`, `check`, `status`, and `plan` accept `--json`; `metrics`
   `sudo`.
 - `--dry-run`: Explicit preview; always wins over `--apply`, so both flags together never write.
 - `--show-secrets`: Print private keys and pre-shared keys to stdout instead of redacting.
-- `--lang {auto,en,es,de}`: Force language or auto-detect system locale.
+- `--lang {auto,en,es,de}`: Force language or auto-detect system locale. Precedence is
+  `--lang` > `WG_MANAGER_LANG` > the language saved by `init` in the state file > auto-detect
+  (a TTY with a non-es/de locale shows the language menu once per command until one of the
+  above pins it; note `sudo` may strip `WG_MANAGER_LANG`, the saved state survives).
 - `--color {always,auto,never}` / `--no-color`: Control ANSI color output.
 - `--width <N>`: Set column wrapping width (40-200, auto by default).
 - `--self-test`: Run offline audit verifying key formats, nftables safety, regexes, and IPAM allocation.
@@ -402,6 +407,11 @@ over `--apply`. `list`, `check`, `status`, and `plan` accept `--json`; `metrics`
   `rollback --to <state snapshot>` from `<state_dir>/backups/`.
 - `check` in Docker -> a `drop` policy in `ip filter FORWARD` blocks forwarded tunnel traffic -> add an
   accept for `<ifname>` before the drop, or keep WireGuard off that path.
+- Lost WAN IPv4/IPv6 after `init`/`reload --apply` -> the `systemd-networkd` restart re-manages every
+  interface and drops hand-added (`ip addr add`) addresses -> make WAN addresses persistent
+  (`/etc/netplan/*.yaml`, a networkd `.network`, or `/etc/network/interfaces`). While IPv6 is enabled
+  the tool pins `accept_ra = 2` on the WAN (forwarding would otherwise kill SLAAC/DHCPv6) and warns
+  when the WAN loses addresses across an apply/uninstall.
 
 ## Compatibility
 

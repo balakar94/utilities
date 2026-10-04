@@ -689,6 +689,57 @@ def _sync_wg_peers(state, ifname):
             pass
 
 
+def _wan_global_addrs(wan):
+    """Snapshot global-scope addresses on an interface; None when unknown.
+
+    Best-effort only: a missing `ip`, a failed call or unparsable output
+    disables the post-apply WAN guard instead of failing the apply.
+    """
+    ip_exe = shutil.which("ip")
+    if not ip_exe or not wan:
+        return None
+    rc, out, _err = _run_capture([ip_exe, "-o", "addr", "show", "dev", str(wan)])
+    if rc != 0:
+        return None
+    found = set()
+    for line in str(out or "").splitlines():
+        # iproute2 -o shape: idx: ifname family addr/plen ... scope <scope>
+        parts = line.split()
+        if len(parts) < 4 or parts[1] != str(wan):
+            continue
+        family, addr = parts[2], parts[3].split("/")[0]
+        if family not in ("inet", "inet6"):
+            continue
+        if "." not in addr and ":" not in addr:
+            continue
+        try:
+            scope = parts[parts.index("scope") + 1]
+        except (ValueError, IndexError):
+            continue
+        if scope == "global":
+            found.add(family + " " + addr)
+    return found
+
+
+def _warn_if_wan_addrs_lost(wan, before):
+    """Loud (non-fatal) warning when the WAN lost addresses across a restart.
+
+    A `systemd-networkd` restart re-manages every interface, so addresses
+    added by hand (`ip addr add`, one-shot cloud scripts) vanish unless they
+    live in netplan/networkd/ifupdown config. Only a strict shrink warns, so
+    a DHCP renumber (same count, new address) stays quiet. Never fails the
+    apply: the WireGuard side is fine, the host addressing needs attention.
+    """
+    if not before:
+        return
+    after = _wan_global_addrs(wan)
+    if after is None:
+        return
+    lost = sorted(before - after)
+    if lost and len(after) < len(before):
+        eprint(note(t("warn_wan_addr_lost").format(wan=wan, addrs=", ".join(lost)), "warn"))
+
+
 def get_wg_live_dump(ifname):
     """Query wg show <ifname> dump. Return dict: pubkey -> {endpoint, allowed_ips, handshake, rx, tx}."""
     exe = shutil.which("wg")
@@ -785,6 +836,9 @@ def apply_system_reload(state, backend, firewall, args=None):
     validate_ifname(wan)
     if ifname == wan:
         raise ValueError(t("err_invalid_ifname").format(value="ifname == wan_iface (" + ifname + ")"))
+    # Snapshot WAN addresses before any restart: a networkd restart flushes
+    # hand-added (non-persistent) addresses on every interface, not just wg.
+    wan_addrs_before = _wan_global_addrs(wan)
     # 2. Render everything first; a render error aborts before writing.
     nft_content = ""
     nft_file = _sp("/etc/nftables.d/90-wg-manager.nft")
@@ -1006,6 +1060,7 @@ def apply_system_reload(state, backend, firewall, args=None):
             _run_best_effort([ctl, "enable", "--now", "wg-manager-expire.timer"])
         else:
             _run_best_effort([ctl, "disable", "--now", "wg-manager-expire.timer"])
+    _warn_if_wan_addrs_lost(wan, wan_addrs_before)
     return True
 
 
@@ -1035,6 +1090,8 @@ def apply_system_uninstall(state, args=None):
     """Remove system configurations, live wireguard interface, sysctl, and firewall rules."""
     srv = state.get("server", {}) if isinstance(state, dict) else {}
     ifname = str(srv.get("ifname", "wg0") or "wg0")
+    wan = str(srv.get("wan_iface") or srv.get("wan") or "eth0")
+    wan_addrs_before = _wan_global_addrs(wan)
 
     removed = []
 
@@ -1184,6 +1241,7 @@ def apply_system_uninstall(state, args=None):
         _run_best_effort([ufw_cmd, "route", "delete", "allow", "in", "on", str(ifname)])
         _run_best_effort([ufw_cmd, "delete", "allow", str(port) + "/udp"])
 
+    _warn_if_wan_addrs_lost(wan, wan_addrs_before)
     return removed
 
 

@@ -492,10 +492,16 @@ def render_sysctl(state):
         "net.ipv4.conf.default.rp_filter = 2",
         "net.ipv4.conf." + str(wan) + ".rp_filter = 2",
         "net.ipv4.conf." + str(ifname) + ".rp_filter = 2",
-        "# Keep IPv6 RA on WAN only; wg interfaces use static addresses.",
-        "# net.ipv6.conf." + str(wan) + ".accept_ra = 1",
-        "# net.ipv6.conf." + str(ifname) + ".accept_ra = 0",
     ])
+    if mode != "disabled":
+        # Enabling IPv6 forwarding makes the kernel ignore RAs (accept_ra
+        # effectively 0), which kills SLAAC/DHCPv6 on the WAN. Pin accept_ra=2
+        # on the WAN to restore pre-forwarding behavior; the tunnel interface
+        # uses static addresses only.
+        lines.extend([
+            "net.ipv6.conf." + str(wan) + ".accept_ra = 2",
+            "net.ipv6.conf." + str(ifname) + ".accept_ra = 0",
+        ])
     return "\n".join(lines) + "\n"
 
 

@@ -480,6 +480,53 @@ def main():
                 rec("missing firewall engine refused", "nft" in str(exc), str(exc))
             finally:
                 _system_mod.shutil.which = _saved_which
+            # Unit-level: the WAN guard parses `ip -o` output and degrades safely.
+            _saved_capture = _system_mod._run_capture
+            _saved_wan_snapshot = _system_mod._wan_global_addrs
+            _saved_eprint = _system_mod.eprint
+            try:
+                _system_mod.shutil.which = lambda name: None
+                rec("WAN guard skips without ip", _system_mod._wan_global_addrs("eth0") is None, "expected None")
+            finally:
+                _system_mod.shutil.which = _saved_which
+            try:
+                _system_mod.shutil.which = lambda name: "/sbin/ip"
+                sample = (
+                    "2: ens6    inet 212.227.83.103/32 scope global ens6\\       valid_lft forever preferred_lft forever\n"
+                    "2: ens6    inet6 2001:ba0:23b:4d00::1/128 scope global \\       valid_lft forever preferred_lft forever\n"
+                    "2: ens6    inet6 fe80::1:9fff:fe5a:9eff/64 scope link \\       valid_lft forever preferred_lft forever\n"
+                )
+                _system_mod._run_capture = lambda argv, timeout=15: (0, sample, "")
+                snap = _system_mod._wan_global_addrs("ens6")
+                rec("WAN guard parses globals", snap == {"inet 212.227.83.103", "inet6 2001:ba0:23b:4d00::1"}, f"snap={snap}")
+                _system_mod._run_capture = lambda argv, timeout=15: (1, "", "nope")
+                rec("WAN guard skips on ip failure", _system_mod._wan_global_addrs("ens6") is None, "expected None")
+            finally:
+                _system_mod.shutil.which = _saved_which
+                _system_mod._run_capture = _saved_capture
+            # Unit-level: sysctl pins accept_ra on the WAN while IPv6 is enabled.
+            from lib.renderers import render_sysctl as _render_sysctl
+            sys6 = _render_sysctl({"server": {"ifname": "wg0", "wan_iface": "ens6"}, "ipv6": {"mode": "nat66"}})
+            rec("sysctl pins WAN accept_ra=2", "net.ipv6.conf.ens6.accept_ra = 2" in sys6, sys6[-200:])
+            rec("sysctl silences wg accept_ra", "net.ipv6.conf.wg0.accept_ra = 0" in sys6, sys6[-200:])
+            sys4 = _render_sysctl({"server": {"ifname": "wg0", "wan_iface": "ens6"}, "ipv6": {"mode": "disabled"}})
+            rec("sysctl omits accept_ra when disabled", "accept_ra" not in sys4, sys4[-200:])
+            # Unit-level: the WAN guard warns on shrink, stays quiet on renumber.
+            warned = []
+            try:
+                _system_mod.eprint = warned.append
+                _system_mod._wan_global_addrs = lambda wan: {"inet 212.227.83.103"}
+                _system_mod._warn_if_wan_addrs_lost("ens6", {"inet 212.227.83.103", "inet6 2001:ba0:23b:4d00::1"})
+                rec("WAN guard warns on shrink", any("ens6" in str(m) for m in warned), f"warned={warned}")
+                warned.clear()
+                _system_mod._wan_global_addrs = lambda wan: {"inet 212.227.83.104"}
+                _system_mod._warn_if_wan_addrs_lost("ens6", {"inet 212.227.83.103"})
+                rec("WAN guard quiet on renumber", not warned, f"warned={warned}")
+                _system_mod._warn_if_wan_addrs_lost("ens6", None)
+                rec("WAN guard quiet when unknown", not warned, f"warned={warned}")
+            finally:
+                _system_mod.eprint = _saved_eprint
+                _system_mod._wan_global_addrs = _saved_wan_snapshot
 
             # Sandboxed apply: init --apply writes the full file set.
             # The state lives in a dedicated subdirectory so uninstall only
@@ -508,6 +555,45 @@ def main():
                 rec("netdev mode is private", mode in (0o600, 0o640), f"mode={oct(mode)}")
             rec("state mode is 0600", stat.S_IMODE(init_state.stat().st_mode) == 0o600, f"mode={oct(stat.S_IMODE(init_state.stat().st_mode))}")
             rec("state dir is 0700", stat.S_IMODE(init_state.parent.stat().st_mode) == 0o700, f"mode={oct(stat.S_IMODE(init_state.parent.stat().st_mode))}")
+            # Regression: a maskless prefix fails fast at the prefix prompt
+            # instead of collapsing pools ("10.94.0.0" silently became /32).
+            bare_state = Path(tmp) / "barestatedir" / "state.json"
+            bare_env = fake_env(tmp, bindir, bare_state, sysroot)
+            bare_init = run([
+                "init", "--apply", "--yes",
+                "--set", "endpoint=vpn.example.com", "--set", "port=51820",
+                "--set", "mtu=1420", "--set", "ifname=wg9", "--set", "backend=networkd",
+                "--set", "wan_iface=eth0", "--set", "ipv4_prefix=10.94.0.0",
+                "--set", "ipv4_hub=10.94.0.1", "--set", "ipv6_mode=disabled",
+            ], env=bare_env, cwd=tmp)
+            bare_out = bare_init.stdout + bare_init.stderr
+            rec("init rejects maskless prefix", bare_init.returncode != 0, f"rc={bare_init.returncode}")
+            rec("mask error hints the mask", "/24" in bare_out, bare_out[-200:])
+            rec("maskless init writes nothing", not bare_state.exists(), "state was written")
+            # Language persistence: init stores the choice; later commands
+            # reuse it without --lang; WG_MANAGER_LANG wins over state.
+            lang_state = Path(tmp) / "langstatedir" / "state.json"
+            lang_env = fake_env(tmp, bindir, lang_state, sysroot, WG_MANAGER_LANG="es")
+            lang_init = run([
+                "init", "--apply", "--yes",
+                "--set", "endpoint=vpn.example.com", "--set", "port=51820",
+                "--set", "mtu=1420", "--set", "ifname=wg8", "--set", "backend=networkd",
+                "--set", "wan_iface=eth0", "--set", "ipv4_prefix=10.94.0.0/24",
+                "--set", "ipv4_hub=10.94.0.1", "--set", "ipv6_mode=disabled",
+            ], env=lang_env, cwd=tmp)
+            rec("init with env lang exits 0", lang_init.returncode == 0, f"rc={lang_init.returncode} err={(lang_init.stdout + lang_init.stderr)[-200:]}")
+            lang_saved = ""
+            if lang_state.exists():
+                lang_saved = json.loads(lang_state.read_text(encoding="utf-8")).get("server", {}).get("lang", "")
+            rec("init stores server.lang", lang_saved == "es", f"lang={lang_saved!r}")
+            noenv = fake_env(tmp, bindir, lang_state, sysroot)
+            show_es = run(["show", "nosuchpeer"], env=noenv, cwd=tmp)
+            show_es_out = show_es.stdout + show_es.stderr
+            rec("saved lang reused (es)", show_es.returncode != 0 and "no encontrado" in show_es_out, f"rc={show_es.returncode} out={show_es_out[-200:]}")
+            deenv = fake_env(tmp, bindir, lang_state, sysroot, WG_MANAGER_LANG="de")
+            show_de = run(["show", "nosuchpeer"], env=deenv, cwd=tmp)
+            show_de_out = show_de.stdout + show_de.stderr
+            rec("env lang beats saved (de)", show_de.returncode != 0 and "nicht gefunden" in show_de_out, f"rc={show_de.returncode} out={show_de_out[-200:]}")
             # sysctl snapshot only exists when /proc/sys is readable (Linux).
             if Path("/proc/sys/net/ipv4/ip_forward").exists():
                 rec("init records sysctl_original", "sysctl_original" in init_state.read_text(encoding="utf-8"), "no sysctl snapshot")

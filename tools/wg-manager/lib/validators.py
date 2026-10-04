@@ -46,6 +46,14 @@ def validate_prefix(value):
     return str(net)
 
 
+def validate_tunnel_prefix(value):
+    """Tunnel prefixes need an explicit mask: a bare IP parses as /32 and
+    leaves no room for pools, failing much later at the pool prompts."""
+    if "/" not in str(value or ""):
+        raise ValueError(t("err_prefix_needs_mask").format(value=value))
+    return validate_prefix(value)
+
+
 def validate_ip(value):
     try:
         addr = ipaddress.ip_address(str(value).split("/")[0].strip())

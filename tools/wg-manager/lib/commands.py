@@ -127,6 +127,7 @@ from .validators import (
     validate_routes_for_role,
     validate_safe_path,
     validate_traffic,
+    validate_tunnel_prefix,
 )
 
 
@@ -282,7 +283,8 @@ def _collect_init_proposal(args):
     if detected_wan and tty and "wan_iface" not in provided:
         print(t("msg_wan_auto").format(iface=paint(detected_wan, "accent", args)))
     wan_iface = validate_ifname(ask("wan_iface", t("q_wan_iface").format(default=wan_default), wan_default))
-    v4prefix = validate_prefix(ask("ipv4_prefix", t("q_ipv4_prefix").format(default=dflt["ipv4"]["prefix"]), dflt["ipv4"]["prefix"]))
+    v4prefix = ask_valid("ipv4_prefix", t("q_ipv4_prefix").format(default=dflt["ipv4"]["prefix"]), dflt["ipv4"]["prefix"],
+                         validate_tunnel_prefix)
     v4hub = validate_ip(ask("ipv4_hub", t("q_ipv4_hub").format(default="10.90.90.1"), "10.90.90.1"))
     v6mode = validate_ipv6_mode(ask("ipv6_mode", t("q_ipv6_mode").format(default="disabled"), "disabled"))
     v6prefix = ""
@@ -291,7 +293,7 @@ def _collect_init_proposal(args):
     if v6mode != "disabled":
         base = "fd90:90:90::/64" if v6mode in ("ula", "nat66") else "2001:db8:1234:9000::/64"
         v6prefix = ask_valid("ipv6_prefix", t("q_ipv6_prefix").format(default=base), base,
-                             lambda raw: validate_reconfigure_prefix(v6mode, raw))
+                             lambda raw: validate_reconfigure_prefix(v6mode, validate_tunnel_prefix(raw)))
         hub_base = str(ipaddress.ip_network(v6prefix, strict=False).network_address + 1)
         v6hub = validate_ip(ask("ipv6_hub", t("q_ipv6_hub").format(default=hub_base), hub_base))
         wan_v6 = ask("ipv6_wan", t("q_wan_v6").format(default=""), "")
@@ -377,7 +379,7 @@ def _collect_init_proposal(args):
             pools_v6.append({"name": "clients", "range": v6clients_default, "kind": "next-free"})
     state = {
         "schema_version": SCHEMA_VERSION,
-        "server": {"endpoint": endpoint, "port": port, "mtu": mtu, "ifname": ifname, "backend": backend, "wan_iface": wan_iface, "dns": dns, "firewall": detect_firewall_default()},
+        "server": {"endpoint": endpoint, "port": port, "mtu": mtu, "ifname": ifname, "backend": backend, "wan_iface": wan_iface, "dns": dns, "firewall": detect_firewall_default(), "lang": current_lang()},
         "ipv4": {"prefix": v4prefix, "hub": v4hub},
         "ipv6": {"mode": v6mode, "prefix": v6prefix, "hub": v6hub, "wan_v6": wan_v6},
         "pools_v4": pools_v4,

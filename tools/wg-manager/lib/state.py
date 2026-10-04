@@ -275,6 +275,26 @@ def state_dir():
     return state_path().parent
 
 
+def peek_saved_lang():
+    """Best-effort read of the persisted UI language (`server.lang`).
+
+    Used only to remember the operator's language choice. Never raises:
+    a missing, unreadable or corrupt state must not break startup.
+    """
+    try:
+        raw = Path(state_path()).read_text(encoding="utf-8")
+        data = json.loads(raw)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    server = data.get("server")
+    if not isinstance(server, dict):
+        return None
+    lang = server.get("lang")
+    return lang if lang in ("en", "es", "de") else None
+
+
 def default_state():
     return {
         "schema_version": SCHEMA_VERSION,
