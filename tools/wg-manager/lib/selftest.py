@@ -11,6 +11,7 @@ from pathlib import Path
 
 from .commands import cmd_reconfigure, cmd_reload
 from .crypto import is_valid_wgkey
+from .errors import WgError
 from .i18n import CONFIRM_TOKENS, STRINGS, detect_system_lang, t
 from .ipam import (
     IPAMError,
@@ -221,6 +222,13 @@ def cmd_self_test(_args=None):
                 {"name": "c1", "role": "client", "kind": "ondemand", "v4": "10.90.90.2", "v6": "", "tombstoned": False},
             ]
             state_file.write_text(json.dumps(fixture), encoding="utf-8")
+            # The state-trust check (root) requires 0600; keep the fixture valid
+            # so --self-test passes both as a normal user and when install.sh
+            # verifies the staged zipapp as root.
+            try:
+                os.chmod(state_file, 0o600)
+            except OSError:
+                pass
             old_state = os.environ.get("WG_MANAGER_STATE")
             os.environ["WG_MANAGER_STATE"] = str(state_file)
             try:
@@ -250,7 +258,7 @@ def cmd_self_test(_args=None):
                     os.environ.pop("WG_MANAGER_STATE", None)
                 else:
                     os.environ["WG_MANAGER_STATE"] = old_state
-    except (OSError, ValueError, SystemExit) as exc:
+    except (OSError, ValueError, SystemExit, WgError) as exc:
         fail("reconfigure dry-run raised: " + str(exc))
     # 11. Color disabled in pipes (plain substrings preserved).
     try:
@@ -398,8 +406,170 @@ def cmd_self_test(_args=None):
         red = redact_text('x PrivateKey = ABC\n{"privkey": "SECRET"}')
         if "ABC" in red or "SECRET" in red:
             fail("redact_text leaked secret")
+        # Default policy is accept-only: the tool must never render a drop
+        # verdict itself (sink use-case); drops belong to the operator.
+        if "policy drop" in nft_out or "policy drop" in render_nft(st):
+            fail("rendered nft contains a default drop policy")
     except (ValueError, KeyError) as exc:
         fail("key/render/nft checks raised: " + str(exc))
+    # 15b. Endpoint normalization, NetworkManager route keyfile shape and
+    # state-path/SYSROOT guards (regressions of the unattended hardening).
+    try:
+        from .constants import _resolve_sysroot
+        from .state import state_path
+        from .validators import normalize_endpoint
+        if normalize_endpoint("vpn.example.com:51821") != ("vpn.example.com", 51821):
+            fail("normalize_endpoint host:port failed")
+        if normalize_endpoint("[2001:db8::1]:51820") != ("2001:db8::1", 51820):
+            fail("normalize_endpoint bracketed v6 failed")
+        if normalize_endpoint("[2001:db8::1]") != ("2001:db8::1", None):
+            fail("normalize_endpoint bare bracketed v6 failed")
+        if normalize_endpoint("vpn.example.com") != ("vpn.example.com", None):
+            fail("normalize_endpoint hostname failed")
+        ep_state = default_state()
+        ep_state["server"]["private_key"] = good
+        ep_state["server"]["public_key"] = good
+        ep_state["server"]["endpoint"] = "vpn.example.com:51821"
+        ep_peer = {"name": "c", "role": "client", "traffic": "server-only",
+                   "privkey": good, "pubkey": good, "v4": "10.90.90.2", "keepalive": 25}
+        ep_out = render_wgquick(ep_state, ep_peer, show_secrets=True)
+        if "Endpoint = vpn.example.com:51821" not in ep_out or "[vpn.example.com" in ep_out:
+            fail("endpoint host:port render failed")
+        nm_state = default_state()
+        nm_state["server"]["private_key"] = good
+        nm_state["server"]["public_key"] = good
+        nm_state["peers"] = [{"name": "br", "role": "infra", "kind": "permanent", "pubkey": good,
+                              "privkey": good, "v4": "10.90.90.10", "v6": "", "enabled": True,
+                              "tombstoned": False, "custom_routes": ["192.168.5.0/24"]}]
+        nm_out = render_nm(nm_state, show_secrets=True)
+        if "route1=192.168.5.0/24,10.90.90.10" not in nm_out or "routes=" in nm_out:
+            fail("nm route keyfile shape failed")
+        if _resolve_sysroot("relative/path") != "" or _resolve_sysroot("/") != "":
+            fail("SYSROOT sanitization failed")
+        if _resolve_sysroot("/tmp/wgm-sysroot") != "/tmp/wgm-sysroot":
+            fail("SYSROOT absolute passthrough failed")
+        saved_state_env = os.environ.get("WG_MANAGER_STATE")
+        os.environ["WG_MANAGER_STATE"] = "/state.json"
+        try:
+            try:
+                state_path()
+                fail("state_path accepted a system parent")
+            except ValueError:
+                pass
+        finally:
+            if saved_state_env is None:
+                os.environ.pop("WG_MANAGER_STATE", None)
+            else:
+                os.environ["WG_MANAGER_STATE"] = saved_state_env
+    except (ValueError, KeyError, ImportError) as exc:
+        fail("unattended hardening checks raised: " + str(exc))
+    # 15c. Declarative layer: spec normalization and pure plan diff.
+    try:
+        from .reconcile import compute_plan, plan_summary
+        from .spec import SPEC_API, normalize_spec
+        spec_doc = {
+            "apiVersion": SPEC_API,
+            "server": {"endpoint": "vpn.example.com", "port": 51820, "mtu": 1420, "ifname": "wg0",
+                       "backend": "networkd", "wan_iface": "eth0"},
+            "peers": [{"name": "phone", "role": "client", "traffic": "full-tunnel"}],
+        }
+        desired = normalize_spec(spec_doc)
+        if desired["apiVersion"] != SPEC_API or not desired["peers"]:
+            fail("spec normalize dropped fields")
+        empty = {"server": {}, "ipv4": {}, "ipv6": {}, "pools_v4": [], "pools_v6": [], "peers": []}
+        changes = compute_plan(empty, desired)
+        if not any(c["action"] == "add" and c["name"] == "phone" for c in changes):
+            fail("plan missed peer add")
+        if plan_summary(changes) != {"add": 1, "update": len(changes) - 1, "delete": 0}:
+            fail("plan summary counts wrong")
+        try:
+            normalize_spec({"apiVersion": "wg-manager/v9"})
+            fail("spec accepted unknown apiVersion")
+        except ValueError:
+            pass
+    except (ValueError, KeyError, ImportError) as exc:
+        fail("declarative checks raised: " + str(exc))
+    # 15d. Metrics and log-format helpers (offline, pure).
+    try:
+        from .metrics import collect_metrics, render_prometheus
+        met_state = default_state()
+        met_state["peers"] = [{"name": "p1", "role": "client", "v4": "10.90.90.2",
+                               "pubkey": good, "enabled": True, "tombstoned": False}]
+        import time as _t
+        samples = collect_metrics(met_state, now=int(_t.time()))
+        text = render_prometheus(samples)
+        if "wg_manager_peers_total" not in text or "# TYPE" not in text:
+            fail("metrics exposition malformed")
+        if 'wg_manager_peer_enabled{peer="p1"} 1' not in text:
+            fail("metrics per-peer sample missing")
+    except (ValueError, KeyError, ImportError) as exc:
+        fail("metrics checks raised: " + str(exc))
+    # 16. Init collector round-trip: replaying collected answers via --set
+    # must reproduce the identical proposal (TUI single-pass fidelity).
+    try:
+        from . import commands as _cmdmod
+        from .commands import _collect_init_proposal
+        _saved_isatty = _cmdmod._stdin_isatty
+        _saved_overlap = _cmdmod.check_wan_overlap
+        _saved_onlink = _cmdmod.check_wan_v6_onlink
+        _cmdmod._stdin_isatty = lambda: False
+        # Deterministic offline: host routes vary per machine, pure fixtures
+        # for overlap guards already covered in section 8.
+        _cmdmod.check_wan_overlap = lambda *a, **k: None
+        _cmdmod.check_wan_v6_onlink = lambda *a, **k: None
+        try:
+            seed_sets = [
+                "endpoint=vpn.example.com", "port=51820", "mtu=1420",
+                "ifname=wg0", "backend=networkd", "wan_iface=eth0",
+                "ipv4_prefix=10.90.90.0/24", "ipv4_hub=10.90.90.1",
+                "ipv6_mode=ula", "ipv6_prefix=fd90:90:90::/64",
+                "ipv6_hub=fd90:90:90::1", "ipv6_wan=",
+                "dns=1.1.1.1, 8.8.8.8", "permanent=yes",
+                "infra=10-20", "clients=21-150",
+                "clients_v6=21-150",
+            ]
+            first_args = argparse.Namespace(set=list(seed_sets), apply=False, yes=False,
+                                            sudo=False, dry_run=True, show_secrets=False)
+            state1, answers1 = _collect_init_proposal(first_args)
+            replay_sets = [k + "=" + v for k, v in answers1.items()]
+            second_args = argparse.Namespace(set=replay_sets, apply=False, yes=False,
+                                             sudo=False, dry_run=True, show_secrets=False)
+            state2, _answers2 = _collect_init_proposal(second_args)
+            if json.dumps(state1, sort_keys=True) != json.dumps(state2, sort_keys=True):
+                fail("init collector replay diverged")
+            if set(answers1) != {"endpoint", "port", "mtu", "ifname", "backend", "wan_iface",
+                                 "ipv4_prefix", "ipv4_hub", "ipv6_mode", "ipv6_prefix",
+                                 "ipv6_hub", "ipv6_wan", "dns", "permanent",
+                                 "infra", "clients", "clients_v6"}:
+                fail("init collector answers incomplete: " + str(sorted(answers1)))
+        finally:
+            _cmdmod._stdin_isatty = _saved_isatty
+            _cmdmod.check_wan_overlap = _saved_overlap
+            _cmdmod.check_wan_v6_onlink = _saved_onlink
+    except (SystemExit, WgError) as exc:
+        fail("init collector raised: " + str(getattr(exc, "exit_code", getattr(exc, "code", "?"))))
+    except (ValueError, KeyError) as exc:
+        fail("init collector raised: " + str(exc))
+    # 17. Single dispatch table: every parser subcommand resolves, only the
+    # "menu" placeholder is non-callable, and the CLI table replaces just it
+    # (anti-drift guard for the cli/tui shared dispatch).
+    try:
+        from . import cli as _cli_mod
+        from . import commands as _commands_mod
+        from . import tui as _tui_mod
+        if set(_commands_mod.HANDLERS) != set(_cli_mod.SUBCOMMAND_SPEC):
+            fail("HANDLERS keys != parser subcommands")
+        bad = sorted(k for k, v in _commands_mod.HANDLERS.items() if k != "menu" and not callable(v))
+        if bad:
+            fail("HANDLERS non-callable: " + ",".join(bad))
+        if _commands_mod.HANDLERS.get("menu") is not None:
+            fail("HANDLERS menu placeholder must stay None")
+        if _cli_mod._HANDLERS.get("menu") is not _tui_mod.cmd_menu:
+            fail("CLI menu handler is not tui.cmd_menu")
+        if _cli_mod._HANDLERS.get("sweep") is not _commands_mod.HANDLERS.get("sweep"):
+            fail("CLI sweep diverged from canonical table")
+    except ImportError as exc:
+        fail("dispatch import failed: " + str(exc))
     if failures:
         for item in failures:
             eprint(t("selftest_fail").format(detail=item))

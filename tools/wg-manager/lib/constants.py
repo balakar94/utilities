@@ -1,7 +1,27 @@
 import os
 import re
+from pathlib import Path
 
-SYSROOT = os.environ.get("WG_MANAGER_SYSROOT", "")
+
+def _resolve_sysroot(raw):
+    """Validate the SYSROOT test seam: absolute, not `/`, no `..` components.
+
+    Any invalid value degrades to empty so a stray or hostile environment
+    variable cannot redirect system writes into an unintended prefix.
+    """
+    text = str(raw or "").strip()
+    if not text:
+        return ""
+    try:
+        p = Path(text)
+        if not p.is_absolute() or ".." in p.parts or str(p) == "/":
+            return ""
+        return str(p)
+    except (OSError, ValueError):
+        return ""
+
+
+SYSROOT = _resolve_sysroot(os.environ.get("WG_MANAGER_SYSROOT", ""))
 # Audit fix: C1 - WireGuard base64 key material shape.
 WGKEY_RE = re.compile(r"^[A-Za-z0-9+/]{43}=$")
 # Audit fix: C4 - Linux IF_NAMESIZE bound and shell/nft-safe charset.

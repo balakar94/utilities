@@ -14,7 +14,7 @@ from .presentation import eprint
 
 # ---------------------------------------------------------------- validators
 def validate_name(name):
-    if not isinstance(name, str) or not NAME_RE.match(name):
+    if not isinstance(name, str) or not NAME_RE.fullmatch(name):
         raise ValueError(t("err_invalid_name"))
     if ".." in name or "/" in name or "\\" in name:
         raise ValueError(t("err_path_traversal").format(value=name))
@@ -32,7 +32,8 @@ def _int_range(value, lo, hi, key):
 def validate_port(value):
     return _int_range(value, 1, 65535, "err_invalid_port")
 def validate_mtu(value):
-    return _int_range(value, 1280, 1420, "err_invalid_mtu")
+    # WireGuard requires >= 1280; jumbo LANs may legitimately raise this.
+    return _int_range(value, 1280, 9000, "err_invalid_mtu")
 def validate_keepalive(value):
     return _int_range(value, 0, 120, "err_invalid_keepalive")
 
@@ -45,6 +46,25 @@ def validate_prefix(value):
     return str(net)
 
 
+def validate_tunnel_prefix(value):
+    """Tunnel prefixes need an explicit mask: a bare IP parses as /32 and
+    leaves no room for pools, failing much later at the pool prompts."""
+    if "/" not in str(value or ""):
+        raise ValueError(t("err_prefix_needs_mask").format(value=value))
+    return validate_prefix(value)
+
+
+def validate_hub_in_prefix(hub, prefix):
+    """The tunnel hub must be a usable host address inside its own prefix."""
+    net = ipaddress.ip_network(str(prefix), strict=False)
+    addr = ipaddress.ip_address(str(hub).split("/")[0].strip())
+    if addr.version != net.version or addr not in net:
+        raise ValueError(t("err_hub_outside_prefix").format(hub=hub, prefix=prefix))
+    if addr == net.network_address or (net.version == 4 and addr == net.broadcast_address):
+        raise ValueError(t("err_hub_outside_prefix").format(hub=hub, prefix=prefix))
+    return hub
+
+
 def validate_ip(value):
     try:
         addr = ipaddress.ip_address(str(value).split("/")[0].strip())
@@ -53,11 +73,84 @@ def validate_ip(value):
     return str(addr)
 
 
+def _valid_embedded_port(token):
+    return str(token).isdigit() and 1 <= int(token) <= 65535
+
+
 def validate_endpoint(value):
-    s = str(value)
-    if not s.strip() or "\n" in s or "\r" in s:
+    s = str(value).strip()
+    if not s or len(s) > 253 or any(c in s for c in ("\n", "\r", "\x00", " ", "\t", '"', "'", ";", "#", "$", "`", "\\", "|", "&", "<", ">", "(", ")", "{", "}")):
         raise ValueError(t("err_invalid_endpoint"))
-    return s.strip()
+    # Accept hostname / IPv4 / IPv6 (bare or bracketed) with optional :port.
+    host = s
+    if host.startswith("["):
+        if "]" not in host:
+            raise ValueError(t("err_invalid_endpoint"))
+        end = host.index("]")
+        inside = host[1:end]
+        rest = host[end + 1:]
+        try:
+            import ipaddress as _ip
+            _ip.ip_address(inside)
+        except ValueError:
+            raise ValueError(t("err_invalid_endpoint"))
+        if rest:
+            match = re.fullmatch(r":(\d{1,5})", rest)
+            if not match or not _valid_embedded_port(match.group(1)):
+                raise ValueError(t("err_invalid_endpoint"))
+        return s
+    # Split optional trailing :port (single colon, not IPv6 with multiple colons).
+    base = s
+    if s.count(":") == 1 and re.fullmatch(r"[A-Za-z0-9._-]+:\d{1,5}", s):
+        if not _valid_embedded_port(s.rsplit(":", 1)[1]):
+            raise ValueError(t("err_invalid_endpoint"))
+        base = s.rsplit(":", 1)[0]
+    elif s.count(":") >= 2:
+        # Bare IPv6 literal.
+        try:
+            import ipaddress as _ip
+            _ip.ip_address(s)
+            return s
+        except ValueError:
+            raise ValueError(t("err_invalid_endpoint"))
+    if not re.fullmatch(r"[A-Za-z0-9._-]+", base):
+        # Allow IPv4 literal explicitly.
+        try:
+            import ipaddress as _ip
+            _ip.ip_address(base)
+        except ValueError:
+            raise ValueError(t("err_invalid_endpoint"))
+    return s
+
+
+def normalize_endpoint(value):
+    """Split an endpoint into (host, port|None); host is returned without brackets.
+
+    Accepts hostname, IPv4, bare/bracketed IPv6 and an optional `:port` suffix.
+    Returns (str(value).strip(), None) when the value cannot be parsed, so a
+    caller can still render the raw form instead of crashing.
+    """
+    s = str(value or "").strip()
+    if not s:
+        return "", None
+    if s.startswith("["):
+        end = s.find("]")
+        if end < 0:
+            return s, None
+        host = s[1:end]
+        rest = s[end + 1:]
+        port = None
+        if rest.startswith(":"):
+            cand = rest[1:]
+            if _valid_embedded_port(cand):
+                port = int(cand)
+        return host, port
+    if s.count(":") == 1:
+        left, _, right = s.partition(":")
+        if _valid_embedded_port(right) and left:
+            return left, int(right)
+    # Bare IPv6 (multiple colons) or plain hostname/IPv4.
+    return s, None
 
 
 def validate_traffic(value):
@@ -69,6 +162,12 @@ def validate_traffic(value):
 def validate_backend(value):
     if value not in ("networkd", "nm"):
         raise ValueError(t("err_invalid_backend").format(value=value))
+    return value
+
+
+def validate_firewall(value):
+    if value not in ("nft", "firewalld"):
+        raise ValueError(t("err_invalid_firewall").format(value=value))
     return value
 
 
@@ -88,7 +187,9 @@ def validate_safe_path(value):
 def validate_ifname(value):
     """Audit fix: C4 - strict Linux interface name, safe in nft/sysctl keys."""
     s = str(value)
-    if not IFNAME_RE.match(s):
+    if not IFNAME_RE.fullmatch(s):
+        raise ValueError(t("err_invalid_ifname").format(value=value))
+    if s in ("lo", ".", ".."):
         raise ValueError(t("err_invalid_ifname").format(value=value))
     return s
 
@@ -137,6 +238,44 @@ def validate_routes_for_role(routes, role):
         if str(route) in ("0.0.0.0/0", "::/0") and role != "infra":
             raise ValueError(t("err_route_default_role").format(route=route))
     return routes
+
+
+def find_allowed_ips_overlaps(state):
+    """Return [(name_a, name_b, net_a, net_b)] for overlapping advertised prefixes.
+
+    WireGuard assigns an overlapping prefix to whichever peer was set last and
+    the kernel installs competing FIB routes, so two peers advertising the same
+    or nested network is a silent misconfiguration worth flagging.
+    """
+    entries = []
+    for peer in state.get("peers", []) if isinstance(state, dict) else []:
+        if not isinstance(peer, dict) or peer.get("tombstoned") or not peer.get("enabled", True):
+            continue
+        name = str(peer.get("name", ""))
+        nets = []
+        for key, suffix in (("v4", 32), ("v6", 128)):
+            raw = str(peer.get(key) or "").split("/")[0].strip()
+            if not raw:
+                continue
+            try:
+                nets.append(ipaddress.ip_network(raw + "/" + str(suffix), strict=False))
+            except ValueError:
+                continue
+        if peer.get("role") == "infra":
+            for route in peer.get("custom_routes", []) or []:
+                try:
+                    nets.append(ipaddress.ip_network(str(route), strict=False))
+                except ValueError:
+                    continue
+        entries.append((name, nets))
+    out = []
+    for i in range(len(entries)):
+        for j in range(i + 1, len(entries)):
+            for net_a in entries[i][1]:
+                for net_b in entries[j][1]:
+                    if net_a.version == net_b.version and net_a.overlaps(net_b):
+                        out.append((entries[i][0], entries[j][0], str(net_a), str(net_b)))
+    return out
 
 
 def parse_set_pairs(items):

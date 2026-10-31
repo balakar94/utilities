@@ -75,7 +75,7 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/). This p
 - PowerShell twins for the repo scripts: `scripts/common.ps1`, `scripts/new-tool.ps1`,
   `scripts/list-tools.ps1`. Windows no longer needs bash to scaffold or validate; CI cross-checks
   that both twins generate the same `TOOLS.md`.
-- Dependency bumps: `actions/checkout` v7, `actions/setup-node` v7, `actions/setup-python` v7,
+- Dependency bumps: `actions/checkout` v7, `actions/setup-node` v7.1.0, `actions/setup-python` v7.1.0,
   `gitleaks/gitleaks-action` v3 (Dependabot PRs reconciled in one verified bump).
 - Policy: tools are dependency-free and non-invasive by default. Every tool README must declare
   `Requirements` and `Impact` (`read-only` | `local` | `system`); `system` tools or ones with
@@ -83,6 +83,83 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/). This p
   stricter review. The impact is enforced: `metadata.yaml` requires `impact:` and both
   `list-tools` twins validate it.
 - Removed `.pre-commit-config.yaml` (it was never installed and only duplicated CI).
+
+### wg-manager
+
+- Correctness and unattended-hardening batch: NetworkManager routes now use the documented
+  `routeN=dest/plen,gateway` keyfile form in the matching family section (the semicolon `routes=`
+  list produced empty next hops); systemd `[Route]` gateways are chosen by destination family
+  (IPv6 routes no longer get an IPv4 next hop); an endpoint carrying `host:port` is split once and
+  no longer double-appends the port or brackets a hostname; NetworkManager applies peer changes with
+  `nmcli device reapply` plus `wg syncconf`; the state file is trusted only when it is a regular,
+  root-owned `0600` file outside system directories (symlinks rejected); the `SYSROOT` seam is
+  sanitized; `_mkdir_private` never chmods a pre-existing system parent; the daily expiry timer uses
+  an absolute `ExecStart` with `NoNewPrivileges=`, `ProtectHome=` and `PrivateTmp=`; and
+  `install.sh --verify` checks the installed binary against the manifest `binary_sha256`. The test
+  suite adds renderer, endpoint, state-trust and failure-injection rollback coverage.
+- Live-host fixes found while validating on real Ubuntu 24.04 (systemd-networkd + nftables) and
+  Fedora 44 (NetworkManager + firewalld): `--sudo` re-executes before any handler reads state, so a
+  non-root operator can use it against the `0700 root` state directory (a non-root read now fails
+  with an actionable message, not a traceback); `check` no longer reports `firewall-cmd` as missing
+  on a firewalld host; and the installer updates the manifest's `binary_sha256` after `--restore`, so
+  `--verify` stays consistent with the reinstalled binary. The end-to-end lifecycle (init, add,
+  reconfigure, edit, reload idempotency, check, status, sweep, timer lifecycle, uninstall) and the
+  NetworkManager `routeN=` route installation were verified on real hosts.
+- `wg-manager` declarative unattended layer: new `plan` and `reconcile` commands over a
+  desired-state spec (`apiVersion: wg-manager/v1`, JSON canonical; TOML via `tomllib`; YAML when
+  `PyYAML` is installed). `plan` is read-only and reports a pure diff (`--json`,
+  `--detailed-exitcode` returns `3` on drift); `reconcile` converges idempotently (a converged
+  server reports `changed=false` and writes nothing), supports `--prune` (tombstone, never hard
+  delete) and emits a clean JSON payload when `--json` is used. Secrets stay out of the spec via
+  `{"from_env"}`/`{"from_file"}` indirection. Also fixed: client `custom_routes` are no longer
+  advertised server-side or turned into hub FIB routes (they are reached *through* the hub), and
+  `check` reports overlapping AllowedIPs across peers.
+- `wg-manager` P1 unattended operations: read-only Prometheus exporter (`metrics`, `--format
+  json`, `--out` for a node_exporter textfile) with `wg_manager_*` gauges/counters; bulk
+  idempotent peer import (`peers --file json|ndjson|-`, `--upsert`); opt-in JSON audit lines
+  (`WG_MANAGER_LOG_FORMAT=json`); and `check` now warns when a host default-drop firewall blocks
+  hub-initiated NEW flows to peers.
+- Single error and dispatch path: handlers raise `WgError` instead of bare `SystemExit`
+  (one `HANDLERS` table shared by CLI and TUI, `sweep` reachable from the menu by
+  name); CLI/TUI output and exit codes unchanged.
+- CLI and safety fixes: `--sudo` re-executes the real entrypoint, `--dry-run`
+  prevails over `--apply`, the TUI has an explicit mode with destructive-action
+  confirmations, infra-peer `edit` redacts secrets, `check` returns a real exit
+  code and supports `--json`, `rollback` re-applies networking, and `reload`
+  persists the backend/firewall state.
+- State, storage and packaging: validated state with migrations, lock with
+  timeout, unified backups and `audit.log` rotation, atomic `export` without
+  symlinks, atomic installer with manifest and hash, and sysctl restored on
+  uninstall.
+- New fake-backed test suite; README examples corrected.
+- Merge audit: firewalld opens the WireGuard UDP port in the WAN interface's zone (detected at
+  apply time and persisted as `server.wan_zone`) instead of `trusted`; `check` and `_post_verify`
+  query that zone, and uninstall removes the port from both. nftables forward pinholes are
+  inserted at the head of the host chain and the outbound `oifname` accept is unconditional;
+  uninstall only removes stale `90-wg*.net*` files that carry the manager marker; `rp_filter=2`
+  is scoped to the tunnel interface (the kernel uses `max(all, iface)`), leaving the WAN strict;
+  infra peers render their `Endpoint=`; RouterOS custom IPv6 routes use `/ipv6 route`; the hub
+  address must be a usable host inside its tunnel prefix; endpoint ports are bounded to
+  1-65535; and `check` reports the WAN-zone port.
+- Reconcile/state audit: `reconcile --json` dry-run emits pure JSON (no trailing human line), a
+  converged `reconcile --apply` performs no state, backup or audit write, state must be a regular
+  file with a valid `schema_version`, and a FIFO/symlink can never block or spoof the language
+  probe. The suite now covers both reconcile contracts, root-run fixtures, foreign-file
+  preservation and the new renderers.
+- Installer audit: deterministic zipapp without build-host `__pycache__`, `PYTHONDONTWRITEBYTECODE`
+  so dry-runs and sudo runs never touch the checkout, package-manager prefixes refused (unless
+  `--force`), RHEL-family installs no longer pull in/enable `firewalld`/`NetworkManager`, and the
+  manifest's `prefix`/`files` are verified before `--uninstall`/`--verify`. `--verify` and
+  `--uninstall` no longer execute the installed binary before checking it, and `--restore` only
+  accepts a regular, owned backup.
+- Security audit: uninstall never recursively deletes a shared `WG_MANAGER_STATE` parent (allowlist
+  plus private subdirectories) and refuses `--apply` without a readable state; `--sudo` resolves an
+  absolute, regular, non-symlink entrypoint through `PATH` instead of the caller's cwd; `rollback
+  --to` requires a regular/root-owned `0600` source; state paths reject a symlinked parent and
+  state/audit/lock/marker writes use `O_NOFOLLOW`; the timer `ExecStart` only accepts a non
+  group/world-writable binary; `plan`/`reconcile` surface a redacted PSK rotation; and Prometheus
+  labels escape newlines. Residual: `PATH`-resolved helper binaries and arbitrary `--out`/`--out-dir`
+  destinations are still operator-controlled.
 
 ## [0.1.0] - 2026-09-12
 

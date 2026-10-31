@@ -5,8 +5,8 @@ import shutil
 import subprocess
 
 from .constants import WGKEY_RE
+from .errors import WgError
 from .i18n import t
-from .presentation import eprint
 
 
 def _server_pubkey(state): return (state.get("server", {}) or {}).get("public_key", "")
@@ -15,14 +15,13 @@ def _server_privkey(state): return (state.get("server", {}) or {}).get("private_
 # ---------------------------------------------------------------- wireguard keys
 def is_valid_wgkey(value):
     """Audit fix: C1 - base64 WireGuard key shape (43 chars + '=')."""
-    return isinstance(value, str) and bool(WGKEY_RE.match(value))
+    return isinstance(value, str) and bool(WGKEY_RE.fullmatch(value))
 
 
 def _wg_bin():
     exe = shutil.which("wg")
     if not exe:
-        eprint(t("err_no_wg"))
-        raise SystemExit(1)
+        raise WgError(t("err_no_wg"))
     return exe
 
 
@@ -32,12 +31,10 @@ def wggen():
     try:
         proc = subprocess.run([exe, "genkey"], capture_output=True, text=True, timeout=15, check=False)
     except (OSError, subprocess.SubprocessError) as exc:
-        eprint(str(exc))
-        raise SystemExit(1)
+        raise WgError(str(exc))
     key = (proc.stdout or "").strip()
     if proc.returncode != 0 or not is_valid_wgkey(key):
-        eprint(t("err_no_wg"))
-        raise SystemExit(1)
+        raise WgError(t("err_no_wg"))
     return key
 
 
@@ -49,12 +46,10 @@ def wgpub(privkey):
             [exe, "pubkey"], input=str(privkey), capture_output=True, text=True, timeout=15, check=False
         )
     except (OSError, subprocess.SubprocessError) as exc:
-        eprint(str(exc))
-        raise SystemExit(1)
+        raise WgError(str(exc))
     key = (proc.stdout or "").strip()
     if proc.returncode != 0 or not is_valid_wgkey(key):
-        eprint(t("err_no_wg"))
-        raise SystemExit(1)
+        raise WgError(t("err_no_wg"))
     return key
 
 
@@ -83,6 +78,14 @@ def validate_key_material(state):
     for peer in state.get("peers", []):
         if peer.get("tombstoned") or not peer.get("enabled", True):
             continue
+        exp = peer.get("expires_at")
+        if exp is not None:
+            try:
+                from datetime import datetime, timezone
+                if int(datetime.now(timezone.utc).timestamp()) > int(exp):
+                    continue
+            except (ValueError, TypeError):
+                pass
         pk = peer.get("pubkey", "")
         if not pk or not is_valid_wgkey(pk):
             raise ValueError(t("err_invalid_wgkey").format(path="peer " + str(peer.get("name", "?"))))
