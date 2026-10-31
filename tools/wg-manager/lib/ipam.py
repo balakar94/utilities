@@ -1,11 +1,11 @@
 # ipam.py
 import ipaddress
 import re
-import shutil
 import subprocess
 from pathlib import Path
 
 from .i18n import t
+from .trust import which_trusted
 
 
 # ---------------------------------------------------------------- IPAM
@@ -500,7 +500,7 @@ def _parse_prefix_list(output, exclude_dev=None):
 
 def system_routes_txt():
     """Best-effort `ip route` output, empty string offline."""
-    exe = shutil.which("ip")
+    exe = which_trusted("ip")
     if not exe:
         return "", ""
     try:
@@ -555,7 +555,7 @@ def check_wan_v6_onlink(prefix, wan_prefixes):
 
 
 def wan_v6_prefixes_best_effort():
-    exe = shutil.which("ip")
+    exe = which_trusted("ip")
     if not exe:
         return []
     try:
@@ -601,7 +601,7 @@ def detect_wan_iface():
     """Best-effort WAN interface detection; never raises, never writes."""
     # Primary source: default route via `ip route show default`.
     try:
-        exe = shutil.which("ip")
+        exe = which_trusted("ip")
         if exe:
             try:
                 proc = subprocess.run(

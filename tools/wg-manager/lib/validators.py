@@ -2,7 +2,6 @@
 import ipaddress
 import os
 import re
-import shutil
 import subprocess
 import tempfile
 from datetime import datetime, timezone
@@ -10,6 +9,7 @@ from datetime import datetime, timezone
 from .constants import IFNAME_RE, NAME_RE
 from .i18n import t
 from .presentation import eprint
+from .trust import which_trusted
 
 
 # ---------------------------------------------------------------- validators
@@ -184,6 +184,51 @@ def validate_safe_path(value):
     return s
 
 
+def _safe_parent(path):
+    from pathlib import Path
+    p = Path(str(path))
+    if not p.is_absolute():
+        raise ValueError(t("err_unsafe_output").format(path=path))
+    parent = p.parent
+    try:
+        if parent.is_symlink() or not parent.is_dir():
+            raise ValueError(t("err_unsafe_output").format(path=path))
+        st = parent.stat()
+    except OSError as exc:
+        raise ValueError(t("err_unsafe_output").format(path=path)) from exc
+    try:
+        euid = os.geteuid()
+    except AttributeError:
+        euid = 1000
+    if euid == 0 and (st.st_uid != 0 or st.st_mode & 0o022):
+        raise ValueError(t("err_unsafe_output").format(path=path))
+    return p
+
+
+def validate_output_file(value):
+    """A file this root process may write: absolute, safe parent, not a symlink."""
+    p = _safe_parent(value)
+    if p.exists() and (p.is_symlink() or not p.is_file()):
+        raise ValueError(t("err_unsafe_output").format(path=value))
+    return str(p)
+
+
+def validate_output_dir(value):
+    """A directory this root process may write client configs into."""
+    p = _safe_parent(value)
+    if p.exists():
+        if p.is_symlink() or not p.is_dir():
+            raise ValueError(t("err_unsafe_output").format(path=value))
+        try:
+            euid = os.geteuid()
+        except AttributeError:
+            euid = 1000
+        st = p.stat()
+        if euid == 0 and (st.st_uid != 0 or st.st_mode & 0o077):
+            raise ValueError(t("err_unsafe_output").format(path=value))
+    return str(p)
+
+
 def validate_ifname(value):
     """Audit fix: C4 - strict Linux interface name, safe in nft/sysctl keys."""
     s = str(value)
@@ -293,6 +338,25 @@ def parse_set_pairs(items):
 
 
 
+def nft_chain_has_drop_policy(text, chain_name):
+    """True when the named nft chain declares `policy drop`.
+
+    iptables-nft names its base chains INPUT/FORWARD, so both spellings count.
+    """
+    for name in (str(chain_name), str(chain_name).upper()):
+        in_chain = False
+        needle = "chain " + name
+        for line in str(text).splitlines():
+            stripped = line.strip()
+            if stripped.startswith(needle) and "{" in stripped:
+                in_chain = True
+            elif in_chain and stripped.startswith("chain "):
+                in_chain = False
+            if in_chain and "policy drop" in stripped:
+                return True
+    return False
+
+
 def nft_structural_ok(content):
     """Audit fix: N2 - offline sanity check so a missing nft is not a blind pass."""
     text = str(content)
@@ -317,7 +381,7 @@ def validate_nft_content(content):
     if not nft_structural_ok(content):
         eprint("nft structural validation failed")
         return False
-    exe = shutil.which("nft")
+    exe = which_trusted("nft")
     if not exe:
         print(t("msg_nft_skip"))
         return True

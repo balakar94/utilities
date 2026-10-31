@@ -520,26 +520,27 @@ def main():
             rec("bare entrypoint ignores cwd", resolved != str(fake_cwd / "wg-manager"), f"resolved={resolved}")
             # Unit-level: the firewall precheck refuses a missing engine.
             from lib import system as _system_mod
-            _saved_which = _system_mod.shutil.which
-            _system_mod.shutil.which = lambda name: None
+            from lib import trust as _trust_mod
+            _saved_which = _trust_mod.shutil.which
+            _trust_mod.shutil.which = lambda name: None
             try:
                 _system_mod._precheck_firewall("nft")
                 rec("missing firewall engine refused", False, "no error raised")
             except ValueError as exc:
                 rec("missing firewall engine refused", "nft" in str(exc), str(exc))
             finally:
-                _system_mod.shutil.which = _saved_which
+                _trust_mod.shutil.which = _saved_which
             # Unit-level: the WAN guard parses `ip -o` output and degrades safely.
             _saved_capture = _system_mod._run_capture
             _saved_wan_snapshot = _system_mod._wan_global_addrs
             _saved_eprint = _system_mod.eprint
             try:
-                _system_mod.shutil.which = lambda name: None
+                _trust_mod.shutil.which = lambda name: None
                 rec("WAN guard skips without ip", _system_mod._wan_global_addrs("eth0") is None, "expected None")
             finally:
-                _system_mod.shutil.which = _saved_which
+                _trust_mod.shutil.which = _saved_which
             try:
-                _system_mod.shutil.which = lambda name: "/sbin/ip"
+                _trust_mod.shutil.which = lambda name: str(bindir / "ip")
                 sample = (
                     "2: ens6    inet 212.227.83.103/32 scope global ens6\\       valid_lft forever preferred_lft forever\n"
                     "2: ens6    inet6 2001:ba0:23b:4d00::1/128 scope global \\       valid_lft forever preferred_lft forever\n"
@@ -551,8 +552,68 @@ def main():
                 _system_mod._run_capture = lambda argv, timeout=15: (1, "", "nope")
                 rec("WAN guard skips on ip failure", _system_mod._wan_global_addrs("ens6") is None, "expected None")
             finally:
-                _system_mod.shutil.which = _saved_which
+                _trust_mod.shutil.which = _saved_which
                 _system_mod._run_capture = _saved_capture
+            # nftables: iptables-nft base chains are uppercase; a drop policy
+            # there must be detected before an apply can silently blackhole.
+            from lib.validators import nft_chain_has_drop_policy
+            sample_drop = (
+                "table ip filter {\n"
+                " chain INPUT {\n"
+                "  type filter hook input priority filter; policy drop;\n"
+                " }\n"
+                " chain FORWARD {\n"
+                "  type filter hook forward priority filter; policy accept;\n"
+                " }\n"
+                "}"
+            )
+            rec("nft drop policy detected (INPUT)", nft_chain_has_drop_policy(sample_drop, "input"), "not detected")
+            _saved_drop_which = _system_mod.which_trusted
+            _saved_drop_capture = _system_mod._run_capture
+            try:
+                _system_mod.which_trusted = lambda name: "/sbin/nft" if name == "nft" else None
+                _system_mod._run_capture = lambda argv, timeout=10: (0, sample_drop, "")
+                unmanaged = _system_mod._unmanaged_drop_families()
+                rec("unmanaged drop families detected", unmanaged == ["ip", "ip6"], f"got={unmanaged}")
+            finally:
+                _system_mod.which_trusted = _saved_drop_which
+                _system_mod._run_capture = _saved_drop_capture
+            # A user-writable binary is only accepted for a non-root caller.
+            from lib.trust import which_trusted
+            bad_dir = Path(tmp) / "badbin"
+            bad_dir.mkdir()
+            bad_tool = bad_dir / "tool"
+            bad_tool.write_text("#!/bin/sh\n", encoding="utf-8")
+            bad_tool.chmod(0o777)
+            saved_path = os.environ.get("PATH", "")
+            os.environ["PATH"] = str(bad_dir) + os.pathsep + saved_path
+            try:
+                got_tool = which_trusted("tool")
+            finally:
+                os.environ["PATH"] = saved_path
+            try:
+                is_root = os.geteuid() == 0
+            except AttributeError:
+                is_root = False
+            if is_root:
+                rec("untrusted PATH binary rejected for root", got_tool is None, f"got={got_tool}")
+            else:
+                rec("user PATH binary accepted", got_tool == str(bad_tool), f"got={got_tool}")
+            # A forced backend switch removes the previous stack's files.
+            _saved_sysroot = _system_mod.SYSROOT
+            _saved_backend_which = _system_mod.which_trusted
+            _system_mod.SYSROOT = str(Path(tmp) / "stale-root")
+            _system_mod.which_trusted = lambda name: None
+            try:
+                nm_dir = Path(_system_mod.SYSROOT) / "etc" / "NetworkManager" / "system-connections"
+                nm_dir.mkdir(parents=True)
+                nm_file = nm_dir / "wg-manager.nmconnection"
+                nm_file.write_text("[connection]\n", encoding="utf-8")
+                removed = _system_mod.remove_stale_backend("nm", "wg0")
+                rec("stale NM profile removed", not nm_file.exists() and str(nm_file) in removed, f"removed={removed}")
+            finally:
+                _system_mod.SYSROOT = _saved_sysroot
+                _system_mod.which_trusted = _saved_backend_which
             # Unit-level: sysctl pins accept_ra on the WAN while IPv6 is enabled.
             from lib.renderers import render_sysctl as _render_sysctl
             sys6 = _render_sysctl({"server": {"ifname": "wg0", "wan_iface": "ens6"}, "ipv6": {"mode": "nat66"}})
@@ -730,8 +791,13 @@ def main():
                 rb_apply = run(["rollback", "--to", str(backups[0]), "--apply", "--yes"], env=init_env, cwd=tmp)
                 rec("rollback --apply exits 0", rb_apply.returncode == 0, f"rc={rb_apply.returncode}")
 
-            # reload --apply persists backend/firewall choice.
-            rl = run(["reload", "--apply", "--yes", "--backend", "nm", "--firewall", "nft"], env=init_env, cwd=tmp)
+            # reload --apply persists backend/firewall choice; a backend switch
+            # is explicit and requires --force.
+            rl_guard = run(["reload", "--apply", "--yes", "--backend", "nm", "--firewall", "nft"], env=init_env, cwd=tmp)
+            rec("backend switch requires --force",
+                rl_guard.returncode == 1 and "requires --force" in (rl_guard.stdout + rl_guard.stderr),
+                f"rc={rl_guard.returncode}")
+            rl = run(["reload", "--apply", "--yes", "--backend", "nm", "--firewall", "nft", "--force"], env=init_env, cwd=tmp)
             rec("reload --apply exits 0", rl.returncode == 0, f"rc={rl.returncode} err={(rl.stdout + rl.stderr)[-200:]}")
             st = json.loads(init_state.read_text(encoding="utf-8"))
             rec("reload persists backend", st["server"].get("backend") == "nm", f"backend={st['server'].get('backend')}")
@@ -757,6 +823,7 @@ def main():
             victim = Path(tmp) / "victim.txt"
             victim.write_text("do not touch", encoding="utf-8")
             outdir.mkdir()
+            outdir.chmod(0o700)
             (outdir / "phone.conf").symlink_to(victim)
             exp = run(["export", "phone", "--out-dir", str(outdir), "--apply", "--yes"], env=init_env, cwd=tmp)
             rec("export --apply exits 0", exp.returncode == 0, f"rc={exp.returncode} err={(exp.stdout + exp.stderr)[-200:]}")
@@ -1071,15 +1138,16 @@ def main():
             seeded["server"]["public_key"] = GOOD_KEY_B
             write_state(fstate, json.dumps(seeded, indent=2, sort_keys=True) + "\n")
             os.environ["WG_MANAGER_STATE"] = str(fstate)
+            from lib import trust as _trust_mod
             saved = {
                 "SYSROOT": _sysmod.SYSROOT,
                 "_post_verify": _sysmod._post_verify,
-                "which": _sysmod.shutil.which,
+                "trust_which": _trust_mod.shutil.which,
                 "_precheck_backend": _sysmod._precheck_backend,
                 "_precheck_firewall": _sysmod._precheck_firewall,
             }
             _sysmod.SYSROOT = str(sysroot)
-            _sysmod.shutil.which = lambda *a, **k: None
+            _trust_mod.shutil.which = lambda *a, **k: None
             _sysmod._post_verify = lambda *a, **k: "injected failure"
             _sysmod._precheck_backend = lambda *a, **k: None
             _sysmod._precheck_firewall = lambda *a, **k: None
@@ -1098,7 +1166,7 @@ def main():
             finally:
                 _sysmod.SYSROOT = saved["SYSROOT"]
                 _sysmod._post_verify = saved["_post_verify"]
-                _sysmod.shutil.which = saved["which"]
+                _trust_mod.shutil.which = saved["trust_which"]
                 _sysmod._precheck_backend = saved["_precheck_backend"]
                 _sysmod._precheck_firewall = saved["_precheck_firewall"]
                 os.environ.pop("WG_MANAGER_STATE", None)
@@ -1246,6 +1314,11 @@ def main():
                 rec("metrics --format json is valid", isinstance(met_payload, dict) and "metrics" in met_payload, "bad payload")
             except (ValueError, TypeError) as exc:
                 rec("metrics --format json is valid", False, str(exc))
+            met_out = Path(rtmp) / "metrics.prom"
+            met_nof = run(["metrics", "--out", str(met_out)], env=rec_env, cwd=rtmp)
+            rec("metrics --out requires apply", met_nof.returncode == 0 and not met_out.exists(), "wrote without apply")
+            met_ok = run(["metrics", "--out", str(met_out), "--apply", "--yes"], env=rec_env, cwd=rtmp)
+            rec("metrics --out writes with apply", met_ok.returncode == 0 and met_out.exists(), f"rc={met_ok.returncode}")
 
             # P1: bulk peer import (json + ndjson), idempotent with --upsert.
             import_doc = Path(rtmp) / "peers.json"

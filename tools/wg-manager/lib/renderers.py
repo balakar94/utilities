@@ -1,12 +1,12 @@
 # renderers.py
 import ipaddress
 import re
-import shutil
 import subprocess
 
 from .crypto import _server_privkey, _server_pubkey, is_valid_wgkey
 from .i18n import t
 from .ipam import peers_sorted
+from .trust import which_trusted
 from .validators import normalize_endpoint, validate_endpoint, validate_ifname
 
 
@@ -233,7 +233,7 @@ def render_netdev(state, show_secrets=False):
 def _systemd_version():
     """Detect systemd major version if available; returns int or None."""
     for bin_name in ("systemctl", "networkctl", "systemd-networkd"):
-        exe = shutil.which(bin_name)
+        exe = which_trusted(bin_name)
         if not exe:
             continue
         rc, out, _err = _run_capture([exe, "--version"])

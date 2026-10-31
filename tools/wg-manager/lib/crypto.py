@@ -1,12 +1,12 @@
 # crypto.py
 import base64
 import secrets
-import shutil
 import subprocess
 
 from .constants import WGKEY_RE
 from .errors import WgError
 from .i18n import t
+from .trust import which_trusted
 
 
 def _server_pubkey(state): return (state.get("server", {}) or {}).get("public_key", "")
@@ -19,7 +19,7 @@ def is_valid_wgkey(value):
 
 
 def _wg_bin():
-    exe = shutil.which("wg")
+    exe = which_trusted("wg")
     if not exe:
         raise WgError(t("err_no_wg"))
     return exe
@@ -55,7 +55,7 @@ def wgpub(privkey):
 
 def wgpsk():
     """Audit fix: C1 - pre-shared key via wg genpsk, stdlib fallback."""
-    exe = shutil.which("wg")
+    exe = which_trusted("wg")
     if exe:
         try:
             proc = subprocess.run([exe, "genpsk"], capture_output=True, text=True, timeout=15, check=False)

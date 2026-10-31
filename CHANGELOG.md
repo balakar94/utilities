@@ -152,6 +152,14 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/). This p
   manifest's `prefix`/`files` are verified before `--uninstall`/`--verify`. `--verify` and
   `--uninstall` no longer execute the installed binary before checking it, and `--restore` only
   accepts a regular, owned backup.
+- Residual-risk batch: apply now fails closed when `ip filter`/`ip6 filter` (iptables-nft) has a
+  default-drop policy and `--accept-unmanaged-firewall` was not passed; backend migrations require
+  `--force`, remove the previous stack's files and recommend a reboot; helper binaries go through
+  `which_trusted` (root rejects non-root-owned or group/world-writable `wg`/`qrencode`/system tools,
+  so a planted PATH entry cannot receive key material); `metrics --out` requires `--apply --yes`;
+  output/export/backup destinations need an existing, non-symlink parent that is root-owned when
+  root; and `docs/validation/wg-manager.md` plus ADR 0004 record the real-host sign-off and the
+  reference-README exception.
 - Security audit: uninstall never recursively deletes a shared `WG_MANAGER_STATE` parent (allowlist
   plus private subdirectories) and refuses `--apply` without a readable state; `--sudo` resolves an
   absolute, regular, non-symlink entrypoint through `PATH` instead of the caller's cwd; `rollback

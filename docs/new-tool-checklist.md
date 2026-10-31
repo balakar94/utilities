@@ -5,7 +5,8 @@ Copy into the PR. All checked or the PR does not merge.
 - [ ] Free `kebab-case` name and isolated `tools/<name>/` folder
 - [ ] Valid `metadata.yaml` (`name == folder`, `status: incubating`, `impact: read-only|local|system`,
   `compat` real: `all` unless the tool is OS-specific)
-- [ ] Full-template `README.md` (≤300 words excluding code)
+- [ ] Full-template `README.md` (≤300 words excluding code; a reference tool that outgrows it
+  needs an ADR, see `docs/adr/0004-wg-manager-readme-size.md`)
 - [ ] `README.md` declares `Requirements` and `Impact`
 - [ ] If `system` or third-party deps: dry run by default, rollback documented, stricter review
 - [ ] Exactly ONE executable entrypoint (`main.sh`|`main.py`|`main.ps1`|`main.rb`, `chmod +x`)

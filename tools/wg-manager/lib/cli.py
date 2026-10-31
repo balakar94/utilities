@@ -34,6 +34,7 @@ COMMON_SPEC = (
     ("--no-color", {"action": "store_true"}),
     ("--width", {"type": int, "default": 0}),
     ("--apply", {"action": "store_true"}),
+    ("--accept-unmanaged-firewall", {"action": "store_true"}),
     ("--yes", {"action": "store_true"}),
     ("--sudo", {"action": "store_true"}),
     ("--dry-run", {"action": "store_true"}),
@@ -99,6 +100,7 @@ SUBCOMMAND_SPEC = {
     "reload": (
         ("--backend", {"default": ""}),
         ("--firewall", {"default": ""}),
+        ("--force", {"action": "store_true"}),
     ),
     "check": (("--json", {"action": "store_true"}),),
     "backup": (("--output", {"default": ""}),),

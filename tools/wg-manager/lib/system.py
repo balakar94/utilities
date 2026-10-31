@@ -27,7 +27,8 @@ from .renderers import (
     render_wg_syncconf,
 )
 from .state import _mkdir_private, atomic_write, state_dir
-from .validators import validate_ifname, validate_nft_content
+from .trust import which_trusted
+from .validators import nft_chain_has_drop_policy, validate_ifname, validate_nft_content
 
 
 def _sp(path):
@@ -44,7 +45,7 @@ def resolve_entrypoint(argv0):
     raw = str(argv0 or "").strip()
     if not raw:
         return ""
-    candidate = raw if os.path.isabs(raw) else (shutil.which(raw) or "")
+    candidate = raw if os.path.isabs(raw) else (which_trusted(raw) or "")
     if not candidate or not os.path.isabs(candidate):
         return ""
     try:
@@ -84,7 +85,7 @@ def _manager_exe():
         exe = trusted(argv0)
         if exe:
             return exe
-    exe = trusted(shutil.which("wg-manager") or "")
+    exe = trusted(which_trusted("wg-manager") or "")
     if exe:
         return exe
     return "/usr/local/bin/wg-manager"
@@ -125,7 +126,7 @@ def _remove_tracked(path, written):
 
 def _revert_timer_live():
     """Best-effort disable of a freshly created expiry timer after a failed apply."""
-    ctl = shutil.which("systemctl")
+    ctl = which_trusted("systemctl")
     if ctl and _systemd_is_init():
         _run_best_effort([ctl, "disable", "--now", "wg-manager-expire.timer"])
         _run_best_effort([ctl, "daemon-reload"])
@@ -160,7 +161,7 @@ def require_apply(args, cmd):
     if euid != 0 and not getattr(args, "sudo", False):
         raise WgError(note(t("err_need_root").format(cmd=cmd), "err", args, indent=1))
     if euid != 0 and getattr(args, "sudo", False):
-        sudo = shutil.which("sudo")
+        sudo = which_trusted("sudo")
         if not sudo:
             raise WgError(note(t("err_need_root").format(cmd=cmd), "err", args, indent=1))
         # Re-exec the real entrypoint (repo main.py or the installed zipapp),
@@ -206,7 +207,7 @@ def detect_firewall_default():
         info = _read_os_release()
         if _is_rhel_like(info):
             return "firewalld"
-        if shutil.which("dnf"):
+        if which_trusted("dnf"):
             return "firewalld"
     except (OSError, ValueError):
         pass
@@ -244,7 +245,7 @@ def _precheck_backend(backend):
     """
     if SYSROOT or not _systemd_is_init():
         return
-    ctl = shutil.which("systemctl")
+    ctl = which_trusted("systemctl")
     if not ctl:
         return
     svc = _backend_service(backend)
@@ -255,9 +256,9 @@ def _precheck_backend(backend):
 def _precheck_firewall(firewall):
     """Fail fast when the selected firewall engine cannot be applied."""
     if firewall == "firewalld":
-        if not SYSROOT and not shutil.which("firewall-cmd"):
+        if not SYSROOT and not which_trusted("firewall-cmd"):
             raise ValueError(t("err_firewall_unavailable").format(engine="firewalld", binary="firewall-cmd"))
-    elif not SYSROOT and not shutil.which("nft"):
+    elif not SYSROOT and not which_trusted("nft"):
         raise ValueError(t("err_firewall_unavailable").format(engine="nft", binary="nft"))
 
 
@@ -314,7 +315,7 @@ def _systemd_network_gid():
         return pwd.getpwnam("systemd-network").pw_gid
     except (KeyError, OSError, ImportError):
         pass
-    ctl = shutil.which("systemctl")
+    ctl = which_trusted("systemctl")
     if ctl:
         rc, out, _ = _run_capture([ctl, "show", "-p", "Group", "systemd-networkd"])
         if rc == 0 and "=" in out:
@@ -341,19 +342,19 @@ def _net_diagnostics(ifname, backend, args=None):
     """Read-only, best-effort diagnostics for a failed apply; never raises."""
     lines = ["", section("diagnostics", args)]
     svc = _backend_service(backend)
-    ctl = shutil.which("systemctl")
+    ctl = which_trusted("systemctl")
     if ctl and _systemd_is_init():
         _rc, out, _err = _run_capture([ctl, "is-active", svc])
         lines.append(note(svc + ": " + (out.strip() or "unknown"), "info", args, indent=1))
         _rc, out, _err = _run_capture([ctl, "status", svc, "--no-pager", "-n", "0"])
         for ln in [l for l in out.strip().splitlines() if l.strip()][:6]:
             lines.append("    " + ln)
-    nctl = shutil.which("networkctl")
+    nctl = which_trusted("networkctl")
     if nctl:
         _rc, out, _err = _run_capture([nctl, "status", ifname])
         for ln in [l for l in out.strip().splitlines() if l.strip()][:6]:
             lines.append("    " + ln)
-    jctl = shutil.which("journalctl")
+    jctl = which_trusted("journalctl")
     if jctl and _systemd_is_init():
         _rc, out, _err = _run_capture([jctl, "-u", svc, "-n", "50", "--no-pager"])
         for ln in [l for l in out.strip().splitlines() if l.strip()][-25:]:
@@ -389,7 +390,7 @@ def detect_net_backend():
     try:
         ctl = None
         try:
-            ctl = shutil.which("systemctl")
+            ctl = which_trusted("systemctl")
         except (OSError, ValueError):
             ctl = None
         if ctl:
@@ -474,7 +475,7 @@ def _run_best_effort(argv):
 
 def _restorecon(path):
     """Restore SELinux security context on path if restorecon is available."""
-    r_exe = shutil.which("restorecon")
+    r_exe = which_trusted("restorecon")
     if r_exe:
         _run_best_effort([r_exe, "-F", str(path)])
 
@@ -559,7 +560,7 @@ def _clean_host_filter_rules(nft_exe=None):
     """Surgically remove existing wg-manager tagged rules from table inet filter by handle."""
     if SYSROOT:
         return []
-    exe = nft_exe or shutil.which("nft")
+    exe = nft_exe or which_trusted("nft")
     if not exe:
         return []
     rc, out, _err = _run_capture([exe, "-a", "list", "table", "inet", "filter"])
@@ -589,7 +590,7 @@ def _clean_host_filter_rules(nft_exe=None):
 
 def _link_kind(ifname):
     """Best-effort link kind via `ip -d link show`; None when unknown."""
-    ip_exe = shutil.which("ip")
+    ip_exe = which_trusted("ip")
     if not ip_exe:
         return None
     rc, out, _err = _run_capture([ip_exe, "-d", "link", "show", ifname])
@@ -627,7 +628,7 @@ def _is_owned_link(ifname, state):
 
 def _verify_iface(ifname, tries=1, delay=0.0):
     """Audit fix: C5 - does the interface exist via ip or sysfs (with polling)."""
-    ip_exe = shutil.which("ip")
+    ip_exe = which_trusted("ip")
     for attempt in range(max(1, tries)):
         if ip_exe:
             rc, _out, _err = _run_capture([ip_exe, "link", "show", ifname])
@@ -642,7 +643,7 @@ def _verify_iface(ifname, tries=1, delay=0.0):
 
 def _sysctl_exe():
     """sysctl binary usable in this environment (never the host one under SYSROOT)."""
-    exe = shutil.which("sysctl")
+    exe = which_trusted("sysctl")
     if not exe:
         return None
     if SYSROOT and not Path(_sp("/proc/sys")).exists():
@@ -664,7 +665,7 @@ def _post_verify(state, ifname, backend="networkd", firewall="nftables", tries=1
         return None
     if not _verify_iface(ifname, tries=tries, delay=delay):
         return "interface " + ifname + " missing"
-    wg = shutil.which("wg")
+    wg = which_trusted("wg")
     if wg:
         rc, _out, _err = _run_capture([wg, "show", ifname, "dump"])
         if rc != 0:
@@ -676,13 +677,13 @@ def _post_verify(state, ifname, backend="networkd", firewall="nftables", tries=1
     except OSError:
         pass
     if not SYSROOT and firewall != "firewalld":
-        exe = shutil.which("nft")
+        exe = which_trusted("nft")
         if exe:
             rc, _out, _err = _run_capture([exe, "list", "table", "inet", "wg_manager"])
             if rc != 0:
                 return "nft table inet wg_manager missing or inactive"
     if not SYSROOT and firewall == "firewalld":
-        fw = shutil.which("firewall-cmd")
+        fw = which_trusted("firewall-cmd")
         if fw:
             rc, out, _err = _run_capture([fw, "--state"])
             if rc == 0 and "running" in (out or ""):
@@ -695,6 +696,60 @@ def _post_verify(state, ifname, backend="networkd", firewall="nftables", tries=1
                 if prc != 0:
                     return "firewalld WAN zone " + zone + " missing udp/" + str(port)
     return None
+
+
+def _unmanaged_drop_families():
+    """Return ip/ip6 families whose host filter base chain drops by default.
+
+    Those tables are owned by iptables-nft (Docker, hardened images) and are
+    not edited by this manager; a drop there silently blackholes the tunnel
+    even when `inet wg_manager` accepts the traffic.
+    """
+    if SYSROOT:
+        return []
+    exe = which_trusted("nft")
+    if not exe:
+        return []
+    families = []
+    for family in ("ip", "ip6"):
+        rc, text, _err = _run_capture([exe, "list", "table", family, "filter"])
+        if rc == 0 and (nft_chain_has_drop_policy(text, "input")
+                        or nft_chain_has_drop_policy(text, "forward")):
+            families.append(family)
+    return families
+
+
+def remove_stale_backend(old_backend, ifname):
+    """Best-effort removal of the previous backend's files after a forced switch.
+
+    The new backend has already been applied. For NM -> networkd the profile is
+    deleted and NM reloaded; for networkd -> NM the files are removed but
+    networkd is deliberately not reloaded (that could delete the live link now
+    owned by NM). A reboot is recommended in both directions.
+    """
+    removed = []
+    if old_backend == "nm":
+        nm_file = Path(_sp("/etc/NetworkManager/system-connections/wg-manager.nmconnection"))
+        if nm_file.exists() and not nm_file.is_symlink():
+            try:
+                nm_file.unlink()
+                removed.append(str(nm_file))
+            except OSError:
+                pass
+        nmcli = which_trusted("nmcli")
+        if nmcli:
+            _run_best_effort([nmcli, "con", "delete", "wg-manager-" + str(ifname)])
+            _run_best_effort([nmcli, "con", "reload"])
+    elif old_backend == "networkd":
+        for suffix in (".netdev", ".network"):
+            p = Path(_sp("/etc/systemd/network/90-" + str(ifname) + suffix))
+            if p.exists() and not p.is_symlink():
+                try:
+                    p.unlink()
+                    removed.append(str(p))
+                except OSError:
+                    pass
+    return removed
 
 
 def _firewalld_wan_zone(fw, wan):
@@ -714,7 +769,7 @@ def _sync_wg_peers(state, ifname):
     an already-running link. Returns True when the in-kernel sync succeeded.
     The private-key temp lives 0600 inside the state dir, never in /tmp.
     """
-    wg = shutil.which("wg")
+    wg = which_trusted("wg")
     if not wg or not _verify_iface(ifname):
         return False
     sync_content = render_wg_syncconf(state, show_secrets=True)
@@ -742,7 +797,7 @@ def _wan_global_addrs(wan):
     Best-effort only: a missing `ip`, a failed call or unparsable output
     disables the post-apply WAN guard instead of failing the apply.
     """
-    ip_exe = shutil.which("ip")
+    ip_exe = which_trusted("ip")
     if not ip_exe or not wan:
         return None
     rc, out, _err = _run_capture([ip_exe, "-o", "addr", "show", "dev", str(wan)])
@@ -789,7 +844,7 @@ def _warn_if_wan_addrs_lost(wan, before):
 
 def get_wg_live_dump(ifname):
     """Query wg show <ifname> dump. Return dict: pubkey -> {endpoint, allowed_ips, handshake, rx, tx}."""
-    exe = shutil.which("wg")
+    exe = which_trusted("wg")
     if not exe:
         return {}
     try:
@@ -876,6 +931,9 @@ def apply_system_reload(state, backend, firewall, args=None):
     validate_key_material(state)
     _precheck_backend(backend)
     _precheck_firewall(firewall)
+    unmanaged = _unmanaged_drop_families()
+    if unmanaged and not getattr(args, "accept_unmanaged_firewall", False):
+        raise ValueError(t("err_unmanaged_firewall").format(families=", ".join(unmanaged)))
     srv = state.get("server", {})
     ifname = str(srv.get("ifname", "wg0") or "wg0")
     validate_ifname(ifname)
@@ -972,11 +1030,11 @@ def apply_system_reload(state, backend, firewall, args=None):
             _revert_timer_live()
         return False
     # 4. Activate network backend: load module, reload first, conditional restart, then verify.
-    mod = shutil.which("modprobe")
+    mod = which_trusted("modprobe")
     if mod:
         _run_best_effort([mod, "wireguard"])
     if backend == "nm":
-        nmcli = shutil.which("nmcli")
+        nmcli = which_trusted("nmcli")
         if nmcli:
             _run_best_effort([nmcli, "con", "reload"])
             # `device reapply` applies changed profile properties without a full
@@ -987,7 +1045,7 @@ def apply_system_reload(state, backend, firewall, args=None):
         # Profile reload/reactivation may not push peer changes into the kernel.
         _sync_wg_peers(state, ifname)
     else:
-        nctl = shutil.which("networkctl")
+        nctl = which_trusted("networkctl")
         if nctl:
             _run_best_effort([nctl, "reload"])
             _run_best_effort([nctl, "reconfigure", ifname])
@@ -995,7 +1053,7 @@ def apply_system_reload(state, backend, firewall, args=None):
         # on running links. If wg is available, sync peers in-place via wg syncconf.
         if not _sync_wg_peers(state, ifname):
             if not _verify_iface(ifname, tries=8, delay=0.25):
-                ctl = shutil.which("systemctl")
+                ctl = which_trusted("systemctl")
                 if ctl:
                     _run_best_effort([ctl, "restart", "systemd-networkd"])
                 # networkd needs a moment to create the netdev after a restart.
@@ -1003,8 +1061,8 @@ def apply_system_reload(state, backend, firewall, args=None):
             elif not SYSROOT:
                 # Live host without wg syncconf: recreate link so networkd loads peers from netdev
                 # Never delete a link we do not own (e.g. a typo pointing at eth0).
-                ip_exe = shutil.which("ip")
-                ctl = shutil.which("systemctl")
+                ip_exe = which_trusted("ip")
+                ctl = which_trusted("systemctl")
                 if ip_exe and ctl and _systemd_is_init():
                     if _is_owned_link(ifname, state):
                         _run_best_effort([ip_exe, "link", "delete", "dev", ifname])
@@ -1019,7 +1077,7 @@ def apply_system_reload(state, backend, firewall, args=None):
     # 6. Firewall (validated/rendered earlier).
     ufw_added = []
     if firewall == "firewalld":
-        fw = shutil.which("firewall-cmd")
+        fw = which_trusted("firewall-cmd")
         if fw:
             wan = str(srv.get("wan_iface") or srv.get("wan") or "eth0")
             # Persist the WAN zone so previews, check, verify and uninstall all
@@ -1034,7 +1092,7 @@ def apply_system_reload(state, backend, firewall, args=None):
                         _revert_timer_live()
                     return False
     else:
-        exe = shutil.which("nft")
+        exe = which_trusted("nft")
         if exe:
             _clean_host_filter_rules(exe)
             rc, _out, err = _run_capture([exe, "-f", nft_file])
@@ -1049,7 +1107,7 @@ def apply_system_reload(state, backend, firewall, args=None):
                     _revert_timer_live()
                 return False
         # Internal host firewall support: if UFW is active on Debian/Ubuntu, allow WireGuard port and routing.
-        ufw = shutil.which("ufw")
+        ufw = which_trusted("ufw")
         if ufw:
             rc, out, _ = _run_capture([ufw, "status"])
             if rc == 0 and "Status: active" in out:
@@ -1069,7 +1127,7 @@ def apply_system_reload(state, backend, firewall, args=None):
             _revert_timer_live()
         # Revert UFW pinholes added by this apply.
         if ufw_added:
-            ufw = shutil.which("ufw")
+            ufw = which_trusted("ufw")
             if ufw:
                 port = srv.get("port", 51820)
                 if "route" in ufw_added:
@@ -1078,11 +1136,11 @@ def apply_system_reload(state, backend, firewall, args=None):
                     _run_best_effort([ufw, "delete", "allow", str(port) + "/udp"])
         # Revert the live firewall too: file rollback alone leaves stale rules.
         if firewall == "firewalld":
-            fw = shutil.which("firewall-cmd")
+            fw = which_trusted("firewall-cmd")
             if fw:
                 _run_best_effort([fw, "--reload"])
         else:
-            exe = shutil.which("nft")
+            exe = which_trusted("nft")
             if exe:
                 if Path(nft_file).exists():
                     _run_best_effort([exe, "-f", nft_file])
@@ -1093,18 +1151,18 @@ def apply_system_reload(state, backend, firewall, args=None):
         if ctl_sys:
             _run_best_effort([ctl_sys, "--system"])
         if backend == "nm":
-            nmcli = shutil.which("nmcli")
+            nmcli = which_trusted("nmcli")
             if nmcli:
                 _run_best_effort([nmcli, "con", "reload"])
         else:
-            ctl = shutil.which("systemctl")
+            ctl = which_trusted("systemctl")
             if ctl:
                 _run_best_effort([ctl, "restart", "systemd-networkd"])
         eprint(note(t("msg_rollback_applied").format(reason=reason), "err", args, indent=1))
         emit(note(t("msg_rollback_restored"), "info", args, indent=1))
         return False
     # 8. Expiry timer live state (only after a verified apply).
-    ctl = shutil.which("systemctl")
+    ctl = which_trusted("systemctl")
     if ctl and _systemd_is_init():
         _run_best_effort([ctl, "daemon-reload"])
         if needs_timer:
@@ -1147,7 +1205,7 @@ def apply_system_uninstall(state, args=None):
     removed = []
 
     # 1. Bring down and delete WireGuard interface (only if we own it).
-    ip_exe = shutil.which("ip")
+    ip_exe = which_trusted("ip")
     if ip_exe:
         if _is_owned_link(ifname, state):
             _run_best_effort([ip_exe, "link", "set", "dev", ifname, "down"])
@@ -1157,7 +1215,7 @@ def apply_system_uninstall(state, args=None):
 
     # 2. NetworkManager cleanup (only our wg-manager-<ifname> profile).
     nm_file = Path(_sp("/etc/NetworkManager/system-connections/wg-manager.nmconnection"))
-    nmcli = shutil.which("nmcli")
+    nmcli = which_trusted("nmcli")
     if nmcli:
         _run_best_effort([nmcli, "con", "down", "wg-manager-" + ifname])
         _run_best_effort([nmcli, "con", "delete", "wg-manager-" + ifname])
@@ -1205,10 +1263,10 @@ def apply_system_uninstall(state, args=None):
         except OSError:
             pass
 
-    nctl = shutil.which("networkctl")
+    nctl = which_trusted("networkctl")
     if nctl:
         _run_best_effort([nctl, "reload"])
-    ctl = shutil.which("systemctl")
+    ctl = which_trusted("systemctl")
     if ctl and _systemd_is_init():
         _run_best_effort([ctl, "restart", "systemd-networkd"])
 
@@ -1257,14 +1315,14 @@ def apply_system_uninstall(state, args=None):
                     main_conf.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
         except OSError:
             pass
-    nft_exe = shutil.which("nft")
+    nft_exe = which_trusted("nft")
     if nft_exe:
         _clean_host_filter_rules(nft_exe)
         for tbl in ("inet wg_manager", "ip wg_manager_nat4", "ip6 wg_manager_nat6"):
             _run_best_effort([nft_exe, "delete", "table"] + tbl.split())
 
     # 6. expiry sweep timer: disable first, then remove our units.
-    ctl = shutil.which("systemctl")
+    ctl = which_trusted("systemctl")
     if ctl and _systemd_is_init():
         _run_best_effort([ctl, "disable", "--now", "wg-manager-expire.timer"])
     for unit in ("wg-manager-expire.service", "wg-manager-expire.timer"):
@@ -1278,7 +1336,7 @@ def apply_system_uninstall(state, args=None):
     if ctl and _systemd_is_init():
         _run_best_effort([ctl, "daemon-reload"])
 
-    fw_cmd = shutil.which("firewall-cmd")
+    fw_cmd = which_trusted("firewall-cmd")
     if fw_cmd:
         port = srv.get("port", 51820)
         v4prefix = str(state.get("ipv4", {}).get("prefix", "") or "")
@@ -1298,7 +1356,7 @@ def apply_system_uninstall(state, args=None):
         _run_best_effort([fw_cmd, "--permanent", "--direct", "--remove-rule", "ipv6", "filter", "FORWARD", "0", "-p", "tcp", "--tcp-flags", "SYN,RST", "SYN", "-j", "TCPMSS", "--clamp-mss-to-pmtu"])
         _run_best_effort([fw_cmd, "--reload"])
 
-    ufw_cmd = shutil.which("ufw")
+    ufw_cmd = which_trusted("ufw")
     if ufw_cmd:
         port = srv.get("port", 51820)
         _run_best_effort([ufw_cmd, "route", "delete", "allow", "in", "on", str(ifname)])

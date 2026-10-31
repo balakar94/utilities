@@ -70,10 +70,12 @@ over `--apply`. `list`, `check`, `status`, and `plan` accept `--json`; `metrics`
   `peers_expiring_7d`, per-peer `handshake_age_seconds`, `rx/tx_bytes_total`,
   `enabled`, `expired`) plus `--format json`. `--out FILE` writes the textfile
   (atomically, `0644`) for a node_exporter textfile collector; no daemon listens.
+  `--out` is an explicit write: it requires `--apply --yes` and an absolute
+  path with an existing, safe parent directory.
 
   ```bash
   wg-manager metrics
-  wg-manager metrics --out /var/lib/node_exporter/textfile/wg_manager.prom
+  wg-manager metrics --out /var/lib/node_exporter/textfile/wg_manager.prom --apply --yes
   ```
 
 - `peers`: Bulk, idempotent peer import from JSON, NDJSON or stdin (`--file`, `--format
@@ -273,8 +275,10 @@ over `--apply`. `list`, `check`, `status`, and `plan` accept `--json`; `metrics`
 - `reload`: Render native backend units and firewall rules (`nftables`, `firewalld`, or `ufw`), apply,
   sync peers in-kernel via `wg syncconf`, and verify link health with automatic rollback on failure. A
   successful apply records the chosen backend and firewall in state (`server.backend`,
-  `server.firewall`); every later system apply, `check`, and `rollback` reuses them.
-  - Flags: `--backend networkd|nm`, `--firewall nft|firewalld`.
+  `server.firewall`); every later system apply, `check`, and `rollback` reuses them. A backend
+  switch (`networkd` <-> `nm`) is a migration: it requires `--force`, removes the previous
+  backend's files after the new apply succeeds, and recommends a reboot.
+  - Flags: `--backend networkd|nm`, `--firewall nft|firewalld`, `--force`.
 
   ```bash
   wg-manager reload --dry-run
@@ -308,7 +312,7 @@ over `--apply`. `list`, `check`, `status`, and `plan` accept `--json`; `metrics`
 
 - `backup`: Create an atomic snapshot of `<state_dir>/state.json` under
   `<state_dir>/backups/manual-<timestamp>.json` (`0600`, keeps the latest 20).
-  - Flags: `--output <path>` (custom target path).
+  - Flags: `--output <path>` (absolute custom target; existing, non-symlink parent).
 
   ```bash
   wg-manager backup
@@ -341,6 +345,8 @@ over `--apply`. `list`, `check`, `status`, and `plan` accept `--json`; `metrics`
 
 - `--uninstall`: Trigger server configuration uninstallation and data wipe.
 - `--apply`: Commit writes to disk, systemd units, and firewall rules (default is read-only / dry-run).
+- `--accept-unmanaged-firewall`: Proceed when `ip filter`/`ip6 filter` (iptables-nft) has a
+  default-drop policy this manager does not edit; add the tagged accepts yourself first.
 - `--yes`: Confirm non-interactive execution without interactive prompts.
 - `--sudo`: When not root, re-execute the real entrypoint (installed zipapp or repo `main.py`) through
   `sudo`.
@@ -365,8 +371,9 @@ over `--apply`. `list`, `check`, `status`, and `plan` accept `--json`; `metrics`
   at the head of the host `inet filter` chains so a host `policy drop` keeps working; uninstall
   removes only tagged rules and the managed table. MSS is clamped dynamically with
   `tcp flags syn tcp option maxseg size set rt mtu`. Hosts whose drop policy lives in
-  `ip filter`/`ip6 filter` (iptables-nft/Docker) are reported by `check`; add the tagged accepts
-  there too if you run WireGuard behind such a host firewall.
+  `ip filter`/`ip6 filter` (iptables-nft/Docker) are detected before apply: `check` reports the
+  conflict and `reload`/`init` refuse until you add the tagged accepts there and pass
+  `--accept-unmanaged-firewall`.
 - **`firewalld` (RHEL, Fedora, CentOS, AlmaLinux, Rocky)**: assigns the interface to the `trusted` zone,
   resolving inter-zone forwarding drops introduced in firewalld >= 0.9.0, opens the UDP port in the
   zone bound to the WAN interface (detected at apply time, persisted as `wan_zone`), uses
@@ -413,8 +420,9 @@ over `--apply`. `list`, `check`, `status`, and `plan` accept `--json`; `metrics`
   lower `--mtu` (for example 1412 on PPPoE), and re-issue client configs with `show`/`qr`/`export`.
 - State corrupt or invalid -> malformed JSON or a failed schema/type/name validation -> restore with
   `rollback --to <state snapshot>` from `<state_dir>/backups/`.
-- `check` in Docker -> a `drop` policy in `ip filter FORWARD` blocks forwarded tunnel traffic -> add an
-  accept for `<ifname>` before the drop, or keep WireGuard off that path.
+- `check`/`reload` in Docker -> a `drop` policy in `ip filter`/`ip6 filter` blocks tunneled traffic ->
+  add tagged accepts before the drop and pass `--accept-unmanaged-firewall`, or keep WireGuard off
+  that path.
 - Lost WAN IPv4/IPv6 after `init`/`reload --apply` -> the `systemd-networkd` restart re-manages every
   interface and drops hand-added (`ip addr add`) addresses -> make WAN addresses persistent
   (`/etc/netplan/*.yaml`, a networkd `.network`, or `/etc/network/interfaces`). While IPv6 is enabled
@@ -462,6 +470,15 @@ RHEL-family hosts may need EPEL for `wireguard-tools`.
 - `plan`/`reconcile` are update-in-place: bootstrap a host once with `init`, then keep it converged
   from the spec. Reading the root-owned `0700` state needs root or `--sudo` (no non-root state read).
 - `metrics` is best-effort offline (`wg show` absent returns zeroed per-peer series).
+- Live firewalld/networkd/NetworkManager matrix: see
+  [`docs/validation/wg-manager.md`](../../docs/validation/wg-manager.md). The tool stays
+  `incubating` until that checklist is signed on real RHEL/Fedora and Debian/Ubuntu hosts.
+- Output destinations (`metrics --out`, `export --out-dir`, `backup --output`) require an existing,
+  non-symlink parent; as root the parent must also be root-owned and not group/world-writable.
+- A 300-word README is impractical for this tool; [ADR 0004](../../docs/adr/0004-wg-manager-readme-size.md)
+  records the exception and keeps the reference here as the source of truth.
+- `install.sh` resolves `python3`/`sha256sum` through `PATH`: run it via `sudo` (secure_path) or a
+  trusted PATH, never from a directory with user-writable helpers.
 
 ## License & credits
 

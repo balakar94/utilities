@@ -3,7 +3,6 @@ import ipaddress
 import json
 import os
 import secrets
-import shutil
 import stat
 import subprocess
 import sys
@@ -104,12 +103,15 @@ from .system import (
     format_handshake_age,
     get_wg_live_dump,
     preview_system_uninstall,
+    remove_stale_backend,
     require_apply,
     resolve_entrypoint,
 )
+from .trust import which_trusted
 from .validators import (
     _prefix_is_ula,
     find_allowed_ips_overlaps,
+    nft_chain_has_drop_policy,
     parse_routes_csv,
     parse_set_pairs,
     validate_backend,
@@ -124,6 +126,8 @@ from .validators import (
     validate_mtu,
     validate_name,
     validate_nft_content,
+    validate_output_dir,
+    validate_output_file,
     validate_port,
     validate_prefix,
     validate_reconfigure_prefix,
@@ -197,7 +201,7 @@ def _find_peer_or_exit(state, name, args):
 
 def _iface_exists(ifname):
     """True when the interface is visible via ip(8) or /sys/class/net."""
-    ip_exe = shutil.which("ip")
+    ip_exe = which_trusted("ip")
     if ip_exe:
         try:
             proc = subprocess.run([ip_exe, "link", "show", ifname], capture_output=True, text=True, timeout=5, check=False)
@@ -208,21 +212,6 @@ def _iface_exists(ifname):
         return Path("/sys/class/net/" + ifname).exists()
     except OSError:
         return False
-
-
-def _chain_has_drop_policy(text, chain_name):
-    """True when the named nft chain declares `policy drop`."""
-    in_chain = False
-    needle = "chain " + chain_name
-    for line in str(text).splitlines():
-        stripped = line.strip()
-        if stripped.startswith(needle) and "{" in stripped:
-            in_chain = True
-        elif in_chain and stripped.startswith("chain "):
-            in_chain = False
-        if in_chain and "policy drop" in stripped:
-            return True
-    return False
 
 
 # ---------------------------------------------------------------- init wizard
@@ -573,7 +562,7 @@ def cmd_add(args):
     if role == "client":
         if not pubkey and sys.stdin.isatty():
             pubkey = prompt_value(t("add_pubkey_prompt"), "").strip()
-        if not pubkey and (can_write or shutil.which("wg")):
+        if not pubkey and (can_write or which_trusted("wg")):
             try:
                 privkey = wggen()
                 pubkey = wgpub(privkey)
@@ -609,7 +598,7 @@ def cmd_add(args):
                 elif sys.stdin.isatty():
                     want_psk = prompt_yesno("q_add_psk", default=True)
             else:
-                if can_write or shutil.which("wg"):
+                if can_write or which_trusted("wg"):
                     try:
                         privkey = wggen()
                         pubkey = wgpub(privkey)
@@ -627,7 +616,7 @@ def cmd_add(args):
             elif sys.stdin.isatty():
                 gen_keys = prompt_yesno("q_router_generate_keys", default=True)
             if gen_keys:
-                if can_write or shutil.which("wg"):
+                if can_write or which_trusted("wg"):
                     try:
                         privkey = wggen()
                         pubkey = wgpub(privkey)
@@ -1173,7 +1162,7 @@ def cmd_qr(args):
         content = render_wgquick(state, peer, show_secrets=True)
     except ValueError:
         raise WgError(t("err_peer_no_privkey").format(name=name))
-    exe = shutil.which("qrencode")
+    exe = which_trusted("qrencode")
     if not exe:
         print(t("msg_no_qrencode"))
         print(t("msg_qr_text_fallback"))
@@ -1366,6 +1355,11 @@ def cmd_reload(args):
         return 0
     _precheck_backend(backend)
     with locked_state() as fresh:
+        old_backend = str(fresh.get("server", {}).get("backend") or "")
+        switching = bool(old_backend) and old_backend != backend
+        if switching and not getattr(args, "force", False):
+            raise WgError(t("err_backend_switch_force").format(
+                old=old_backend, new=backend, iface=fresh.get("server", {}).get("ifname", "wg0")))
         # Persist the chosen backend/firewall so later commands do not silently
         # re-render the other stack.
         fresh.setdefault("server", {})["backend"] = backend
@@ -1393,6 +1387,12 @@ def cmd_reload(args):
             raise WgError(str(exc))
         if not applied:
             raise WgError("")
+        if switching:
+            stale = remove_stale_backend(old_backend, str(fresh.get("server", {}).get("ifname", "wg0")))
+            if stale:
+                emit(note(t("backend_switch_clean").format(count=len(stale)), "warn", args, indent=1))
+            else:
+                emit(note(t("backend_switch_reboot"), "warn", args, indent=1))
         save_state(fresh)
         audit("reload", "backend=" + backend + " firewall=" + firewall)
     emit(banner("wg-manager reload", [("mode", "APPLIED")], args))
@@ -1652,7 +1652,7 @@ def cmd_check(args):
     except (OSError, ValueError):
         pass
     # Service check.
-    ctl = shutil.which("systemctl")
+    ctl = which_trusted("systemctl")
     if ctl:
         backend_choice = srv.get("backend", "networkd")
         backend_svc = "NetworkManager" if backend_choice == "nm" else "systemd-networkd"
@@ -1671,7 +1671,7 @@ def cmd_check(args):
             # Even if the systemd unit nftables.service is inactive (or oneshot exited),
             # nftables is active if rules/tables are loaded in the kernel.
             if svc == "nftables" and st != "active":
-                nft_exe = shutil.which("nft")
+                nft_exe = which_trusted("nft")
                 if nft_exe:
                     try:
                         kproc = subprocess.run([nft_exe, "list", "tables"], capture_output=True, text=True, timeout=5, check=False)
@@ -1695,7 +1695,7 @@ def cmd_check(args):
         results.append(("warn", t("check_forward_bad").format(value=fwd_val)))
     # Firewall check.
     nft_ok = False
-    nft_exe = shutil.which("nft")
+    nft_exe = which_trusted("nft")
     if nft_exe:
         try:
             proc = subprocess.run([nft_exe, "list", "tables"], capture_output=True, text=True, timeout=5, check=False)
@@ -1707,7 +1707,7 @@ def cmd_check(args):
     elif fw_choice == "firewalld":
         # firewalld renders no `wg_manager` nft table; its trusted-zone and port
         # checks below are authoritative. Only report a genuinely missing engine.
-        if not shutil.which("firewall-cmd"):
+        if not which_trusted("firewall-cmd"):
             results.append(("skip", t("check_firewall_missing").format(engine=fw_choice, binary="firewall-cmd")))
     else:
         results.append(("skip", t("check_firewall_missing").format(engine=fw_choice, binary="nft")))
@@ -1721,7 +1721,7 @@ def cmd_check(args):
             )
             if rproc.returncode == 0 and rproc.stdout:
                 txt = rproc.stdout
-                has_drop = _chain_has_drop_policy(txt, "input") or _chain_has_drop_policy(txt, "forward")
+                has_drop = nft_chain_has_drop_policy(txt, "input") or nft_chain_has_drop_policy(txt, "forward")
                 tagged_lines = [ln for ln in txt.splitlines() if 'comment "wg-manager"' in ln]
                 has_wg_input = any(("udp dport " + str(srv.get("port", 51820))) in ln for ln in tagged_lines)
                 has_wg_fwd = any(('iifname "' + str(ifname) + '"') in ln for ln in tagged_lines)
@@ -1746,12 +1746,12 @@ def cmd_check(args):
                     [nft_exe, "list", "table", family, "filter"],
                     capture_output=True, text=True, timeout=5, check=False,
                 )
-                if fproc.returncode == 0 and _chain_has_drop_policy(fproc.stdout, "forward"):
+                if fproc.returncode == 0 and nft_chain_has_drop_policy(fproc.stdout, "forward"):
                     results.append(("warn", t("check_host_filter_drop").format(family=label)))
             except (OSError, subprocess.SubprocessError):
                 pass
     # Audit firewalld if present and active
-    fw_exe = shutil.which("firewall-cmd")
+    fw_exe = which_trusted("firewall-cmd")
     if fw_exe and not SYSROOT:
         try:
             fproc = subprocess.run([fw_exe, "--state"], capture_output=True, text=True, timeout=5, check=False)
@@ -1783,7 +1783,7 @@ def cmd_check(args):
         except (OSError, subprocess.SubprocessError):
             pass
     # Audit UFW if present and active
-    ufw_exe = shutil.which("ufw")
+    ufw_exe = which_trusted("ufw")
     if ufw_exe and not SYSROOT:
         try:
             uproc = subprocess.run([ufw_exe, "status"], capture_output=True, text=True, timeout=5, check=False)
@@ -1799,12 +1799,12 @@ def cmd_check(args):
             pass
     # Audit SELinux if present
     if not SYSROOT:
-        selinux_exe = shutil.which("selinuxenabled")
+        selinux_exe = which_trusted("selinuxenabled")
         if selinux_exe:
             try:
                 sproc = subprocess.run([selinux_exe], capture_output=True, timeout=5, check=False)
                 if sproc.returncode == 0:
-                    getenforce_exe = shutil.which("getenforce")
+                    getenforce_exe = which_trusted("getenforce")
                     mode_str = "Enforcing"
                     if getenforce_exe:
                         gproc = subprocess.run(
@@ -1818,7 +1818,7 @@ def cmd_check(args):
                 pass
         # Audit AppArmor if present
         aa_path = Path("/sys/kernel/security/apparmor")
-        aa_exe = shutil.which("aa-status")
+        aa_exe = which_trusted("aa-status")
         if aa_path.exists() or aa_exe:
             try:
                 if aa_exe:
@@ -1867,7 +1867,7 @@ def cmd_check(args):
         except (OSError, subprocess.SubprocessError):
             pass
     if not mss_ok:
-        ipt_exe = shutil.which("iptables")
+        ipt_exe = which_trusted("iptables")
         if ipt_exe:
             try:
                 proc = subprocess.run([ipt_exe, "-S", "FORWARD"], capture_output=True, text=True, timeout=5, check=False)
@@ -1880,7 +1880,7 @@ def cmd_check(args):
     elif nft_ok:
         results.append(("skip", t("check_mss_missing")))
     # Handshake age (best-effort via wg show).
-    wg_exe = shutil.which("wg")
+    wg_exe = which_trusted("wg")
     dump = {}
     wg_ok = False
     if wg_exe:
@@ -1977,6 +1977,7 @@ def cmd_backup(args):
     dest_raw = getattr(args, "output", "") or ""
     if dest_raw:
         validate_safe_path(dest_raw)
+        validate_output_file(dest_raw)
         dest = Path(dest_raw)
     else:
         dest = state_dir() / "backups" / ("manual-" + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S") + "-" + secrets.token_hex(4) + ".json")
@@ -2267,6 +2268,7 @@ def cmd_export(args):
     if not require_apply(args, "export"):
         emit(note("would-export=" + str(len(target_peers)) + " configs to " + str(out_path), "dryrun", args, indent=1))
         return 0
+    validate_output_dir(str(out_path))
     try:
         out_path.mkdir(parents=True, exist_ok=True, mode=0o700)
     except OSError as exc:
@@ -2360,7 +2362,7 @@ def _try_reexec_sudo(args):
         return False
     if not (getattr(args, "sudo", False) or getattr(args, "apply", False)):
         return False
-    sudo = shutil.which("sudo")
+    sudo = which_trusted("sudo")
     entry = resolve_entrypoint(sys.argv[0])
     python = os.path.abspath(sys.executable or "")
     if not sudo or not entry or not python:
@@ -2759,7 +2761,15 @@ def cmd_metrics(args):
     text = render_prometheus(samples, version=VERSION)
     out = getattr(args, "out", "") or ""
     if out:
-        validate_safe_path(out)
+        validate_output_file(out)
+        # Writing a textfile is a side effect: require the same explicit opt-in
+        # as every other writer, but do not require root (node_exporter users
+        # write into their own textfile directory).
+        if getattr(args, "dry_run", False) or not getattr(args, "apply", False):
+            emit(note(t("msg_dry_run"), "dryrun", args, indent=1))
+            return 0
+        if not getattr(args, "yes", False):
+            raise WgError(note(t("err_need_apply_yes"), "err", args, indent=1), 2)
         try:
             atomic_write(Path(out), text, mode=0o644)
         except OSError as exc:
